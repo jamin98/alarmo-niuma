@@ -1,7 +1,8 @@
 // 屏幕上的设置界面：选 WiFi、输密码、改 hub 地址和口令。
 //
 //   设置首页   点一行进去改；底部「取消」「保存并连接」（实体键：左 = 取消，右 = 保存）
-//   选 WiFi    扫描附近的网络，点一下选中；第一行可以手动输入（隐藏网络）
+//   选 WiFi    扫描附近的网络，点一下选中（已保存的直接用存好的密码）；第一行可以手动输入（隐藏网络）
+//   已保存     连上过的 WiFi 列表：点一个切过去，「删除」点两次删掉
 //   屏幕键盘   字母 / 大写 / 符号三套键位，OK 确认；左上角「< 取消」放弃这次修改
 #include "settings.h"
 
@@ -18,11 +19,55 @@
 #endif
 
 Settings S;
+std::vector<SavedNet> savedNets;
 
 // ---------------------------------------------------------------- 存取
 static bool placeholder(const char *v) {
     String s(v);
     return s.isEmpty() || s.indexOf("你的") >= 0 || s.startsWith("YOUR");
+}
+
+// 已保存的 WiFi 存成 nn = 个数，s0/p0、s1/p1… = 名字 / 密码
+static void saveNets() {
+    Preferences p;
+    p.begin("niuma", false);
+    p.putUChar("nn", savedNets.size());
+    for (int i = 0; i < MAX_SAVED_NETS; i++) {
+        String ks = "s" + String(i), kp = "p" + String(i);
+        if (i < (int)savedNets.size()) {
+            p.putString(ks.c_str(), savedNets[i].ssid);
+            p.putString(kp.c_str(), savedNets[i].pass);
+        } else if (p.isKey(ks.c_str())) {
+            p.remove(ks.c_str());
+            p.remove(kp.c_str());
+        }
+    }
+    p.end();
+}
+
+int findSavedNet(const String &ssid) {
+    for (size_t i = 0; i < savedNets.size(); i++)
+        if (savedNets[i].ssid == ssid) return i;
+    return -1;
+}
+
+void rememberNet(const String &ssid, const String &pass) {
+    if (ssid.isEmpty()) return;
+    int i = findSavedNet(ssid);
+    bool same = i == 0 && savedNets[0].pass == pass && S.ssid == ssid && S.pass == pass;
+    if (same) return;                                    // 没变化就不写闪存
+    if (i >= 0) savedNets.erase(savedNets.begin() + i);
+    savedNets.insert(savedNets.begin(), {ssid, pass});
+    if ((int)savedNets.size() > MAX_SAVED_NETS) savedNets.resize(MAX_SAVED_NETS);
+    saveNets();
+    S.ssid = ssid;
+    S.pass = pass;
+    settingsSave();
+}
+
+static void forgetNet(int i) {
+    savedNets.erase(savedNets.begin() + i);
+    saveNets();
 }
 
 void settingsLoad() {
@@ -32,7 +77,17 @@ void settingsLoad() {
     S.pass = p.getString("pass", placeholder(WIFI_SSID) ? "" : WIFI_PASS);
     S.hub = p.getString("hub", HUB_URL);
     S.token = p.getString("token", HUB_TOKEN);
+    savedNets.clear();
+    int n = p.getUChar("nn", 0);
+    for (int i = 0; i < n && i < MAX_SAVED_NETS; i++) {
+        String ss = p.getString(("s" + String(i)).c_str(), "");
+        if (ss.length()) savedNets.push_back({ss, p.getString(("p" + String(i)).c_str(), "")});
+    }
     p.end();
+    if (savedNets.empty() && S.ssid.length()) {          // 以前只存过一个 WiFi：变成列表的第一项
+        savedNets.push_back({S.ssid, S.pass});
+        saveNets();
+    }
 }
 
 void settingsSave() {
@@ -293,7 +348,12 @@ static bool pickWifi(M5Canvas &cv, String &ssid, bool &open) {
             const Net &n = nets[i - 1];
             bool cur = n.ssid == S.ssid;
             cv.setTextColor(cur ? ACC : TFT_WHITE, BG);
-            cv.drawString(fitText(cv, (cur ? "* " : "") + n.ssid, 250), 12, y + rh / 2);
+            cv.drawString(fitText(cv, (cur ? "* " : "") + n.ssid, findSavedNet(n.ssid) >= 0 ? 196 : 250), 12, y + rh / 2);
+            if (findSavedNet(n.ssid) >= 0) {                         // 连过的：标「已保存」
+                cv.setTextDatum(textdatum_t::middle_right);
+                cv.setTextColor(OK_GREEN, BG);
+                cv.drawString("已保存", 266, y + rh / 2);
+            }
             if (!n.open) lockIcon(cv, 272, y + 12);
             bars(cv, 290, y + 11, n.rssi);
         }
@@ -325,6 +385,73 @@ static bool pickWifi(M5Canvas &cv, String &ssid, bool &open) {
     }
 }
 
+// ---------------------------------------------------------------- 已保存的 WiFi
+// 点一个 = 选它（名字和密码填进 T）；「删除」点两次删掉。返回 true = 选了一个
+static bool savedList(M5Canvas &cv, Settings &T) {
+    int page = 0, confirm = -1;
+    const int per = 5, rh = 36, top = 28;
+    const Box back{0, 0, 70, 26}, prev{4, 214, 150, 24}, next{166, 214, 150, 24};
+    while (true) {
+        int total = savedNets.size();
+        int pages = std::max(1, (total + per - 1) / per);
+        page = std::max(0, std::min(page, pages - 1));
+        cv.fillScreen(BG);
+        String title = "已保存的 WiFi（" + String(total) + " 个）";
+        titleBar(cv, title.c_str(), "< 返回");
+        if (total == 0) {
+            cv.setTextDatum(textdatum_t::middle_center);
+            cv.setTextColor(DIM, BG);
+            cv.drawString("还没有。连上过的 WiFi 会自动记在这里", 160, 110);
+        }
+        std::vector<std::pair<Box, int>> dels;
+        for (int r = 0; r < per; r++) {
+            int i = page * per + r;
+            if (i >= total) break;
+            int y = top + r * rh;
+            cv.drawFastHLine(0, y + rh - 1, 320, PANEL);
+            bool cur = savedNets[i].ssid == T.ssid;
+            cv.setTextDatum(textdatum_t::middle_left);
+            cv.setTextColor(cur ? ACC : TFT_WHITE, BG);
+            cv.drawString(fitText(cv, (cur ? "* " : "") + savedNets[i].ssid, 220), 12, y + rh / 2);
+            Box del{246, y + 5, 66, rh - 10};
+            button(cv, del, confirm == i ? "确定删?" : "删除", confirm == i ? 0xD8A3 : 0x6000);
+            dels.push_back({del, i});
+        }
+        button(cv, prev, "< 上一页", page > 0 ? KEY2 : PANEL, page > 0 ? TFT_WHITE : LINE);
+        button(cv, next, "下一页 >", page < pages - 1 ? KEY2 : PANEL, page < pages - 1 ? TFT_WHITE : LINE);
+        cv.pushSprite(0, 0);
+
+        int x, y;
+        Tap t = waitTap(x, y);
+        if (t == TAP_B || (t == TAP_SCREEN && back.hit(x, y))) { beep(); return false; }
+        if (t == TAP_A || (t == TAP_SCREEN && prev.hit(x, y))) { beep(); page--; confirm = -1; continue; }
+        if (t == TAP_C || (t == TAP_SCREEN && next.hit(x, y))) { beep(); page++; confirm = -1; continue; }
+        if (t != TAP_SCREEN) continue;
+        bool handled = false;
+        for (auto &d : dels) {
+            if (!d.first.hit(x, y)) continue;
+            beep();
+            if (confirm == d.second) {
+                forgetNet(d.second);
+                confirm = -1;
+            } else {
+                confirm = d.second;
+            }
+            handled = true;
+            break;
+        }
+        if (handled) continue;
+        confirm = -1;
+        if (y < top || y >= top + per * rh) continue;
+        int i = page * per + (y - top) / rh;
+        if (i >= total) continue;
+        beep();
+        T.ssid = savedNets[i].ssid;
+        T.pass = savedNets[i].pass;
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------- 设置首页
 static String masked(const String &s, const char *empty) {
     if (s.isEmpty()) return empty;
@@ -333,7 +460,7 @@ static String masked(const String &s, const char *empty) {
 
 bool settingsUI(M5Canvas &cv, const char *reason) {
     Settings T = S;                                                  // 改的是副本，保存时才生效
-    const int top = 30, rh = 42;
+    const int top = 30, rh = 34;
     const Box cancelBtn{8, 204, 144, 32}, saveBtn{168, 204, 144, 32};
     cv.setFont(CN);
     cv.setTextSize(1);
@@ -350,10 +477,11 @@ bool settingsUI(M5Canvas &cv, const char *reason) {
             cv.setTextColor(ACC, PANEL);
             cv.drawString(fitText(cv, reason, 100), 6, 13);
         }
-        const char *labels[4] = {"WiFi", "WiFi 密码", "hub 地址", "hub 口令"};
-        String values[4] = {T.ssid.isEmpty() ? "（未设置，点这里选）" : T.ssid, masked(T.pass, "（无密码）"),
+        const char *labels[5] = {"WiFi", "WiFi 密码", "已保存", "hub 地址", "hub 口令"};
+        String values[5] = {T.ssid.isEmpty() ? "（未设置，点这里选）" : T.ssid, masked(T.pass, "（无密码）"),
+                            String(savedNets.size()) + " 个 WiFi，点这里管理",
                             T.hub.isEmpty() ? "（未设置）" : T.hub, masked(T.token, "（没设口令）")};
-        for (int r = 0; r < 4; r++) {
+        for (int r = 0; r < 5; r++) {
             int y = top + r * rh;
             cv.fillRoundRect(6, y + 2, 308, rh - 4, 6, PANEL);
             cv.setTextDatum(textdatum_t::middle_left);
@@ -378,7 +506,7 @@ bool settingsUI(M5Canvas &cv, const char *reason) {
             settingsSave();
             return true;
         }
-        if (t != TAP_SCREEN || y < top || y >= top + 4 * rh) continue;
+        if (t != TAP_SCREEN || y < top || y >= top + 5 * rh) continue;
         beep();
         switch ((y - top) / rh) {
             case 0: {
@@ -387,7 +515,10 @@ bool settingsUI(M5Canvas &cv, const char *reason) {
                 if (!pickWifi(cv, ssid, open)) break;
                 bool same = ssid == T.ssid;
                 T.ssid = ssid;
-                if (open) {
+                int saved = findSavedNet(ssid);
+                if (saved >= 0) {
+                    T.pass = savedNets[saved].pass;                  // 连过的：直接用存好的密码
+                } else if (open) {
                     T.pass = "";
                 } else {
                     String p = same ? T.pass : "";
@@ -396,12 +527,13 @@ bool settingsUI(M5Canvas &cv, const char *reason) {
                 break;
             }
             case 1: keyboard(cv, "WiFi 密码", T.pass); break;
-            case 2: {
+            case 2: savedList(cv, T); break;
+            case 3: {
                 String h = T.hub.isEmpty() ? "http://192.168." : T.hub;
                 if (keyboard(cv, "hub 地址，如 http://192.168.1.100:8765", h)) T.hub = h;
                 break;
             }
-            case 3: keyboard(cv, "hub 口令（hub/config.toml 的 token）", T.token); break;
+            case 4: keyboard(cv, "hub 口令（hub/config.toml 的 token）", T.token); break;
         }
     }
 }

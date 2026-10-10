@@ -283,7 +283,7 @@ Alarmo 装不了第三方固件时，用这一步代替第 4 步。Core2 的屏�
    pio run -t upload
    ```
 
-2. **在屏幕上设置**：第一次开机会直接进入设置界面，扫描附近的 WiFi 点选、用屏幕键盘输密码，再填 hub 地址（如 `http://192.168.x.x:8765`）和口令（`hub/config.toml` 的 `[server] token`，没设就留空），点「保存并连接」。设置存在 Core2 里，以后要改就**按住右键 2 秒**，不用重新编译。只支持 **2.4 GHz** WiFi。
+2. **在屏幕上设置**：第一次开机会直接进入设置界面，扫描附近的 WiFi 点选、用屏幕键盘输密码，再填 hub 地址（如 `http://192.168.x.x:8765`）和口令（`hub/config.toml` 的 `[server] token`，没设就留空），点「保存并连接」。设置存在 Core2 里，以后要改就**按住右键 2 秒**，不用重新编译。连上过的 WiFi 会记成列表，换地方时自动连附近认识的那个。只支持 **2.4 GHz** WiFi。
 3. 连上 hub 就是工位画面。操作见 [怎么操作](#怎么操作)。
 
 想让新烧的 Core2 自带一组默认设置，可以把 `m5core2/include/config.example.h` 复制成同目录下的 `niuma_config.h` 再改（不进 git），见 [m5core2/README.md](m5core2/README.md)。
@@ -490,7 +490,9 @@ python bridge.py --voice-test [完整名] [--wav 文件] # 测按住说话：让
 | 接口 | 用途 |
 |---|---|
 | `GET /` | 网页模拟器 |
-| `GET /stream.mjpg` · `/frame.jpg?q=80&after=帧号` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（Core2 用；响应头 `X-Frame-Id` 是帧号，带 `after` 时等到有新帧才返回）/ 单帧 PNG |
+| `GET /stream.mjpg` · `/frame.jpg?q=80&after=帧号` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（响应头 `X-Frame-Id` 是帧号，带 `after` 时等到有新帧才返回）/ 单帧 PNG |
+| `GET /frame.rle?after=帧号&base=帧号` | Core2 用的增量帧：只发和 `base` 那一帧相比变了的 40×40 小块（RGB565 + 行程压缩）；`base=0` 发整帧 |
+| `POST /api/device_stats` | Core2 每 3 秒报一次性能统计（帧率、下载 / 画图耗时、每帧大小、WiFi 信号），出现在 `/api/state` 的 `core2` 里 |
 | `GET /api/state` | 当前状态（bot、公告、录音、额度、主题等） |
 | `POST /api/button` | `{"button": "dial" \| "back" \| "notify" \| "chat"}`（`chat` = 显示 / 隐藏聊天内容）或 `{"dial": 30}` |
 | `POST /api/poke` | 点名：`{"x": .., "y": ..}`（屏幕坐标）或 `{"name": "短名"}` |

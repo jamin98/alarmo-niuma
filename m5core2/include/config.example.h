@@ -9,7 +9,7 @@
 #define HUB_URL     "http://192.168.1.100:8765"
 #define HUB_TOKEN   ""
 
-#define JPEG_QUALITY   80     // 越低越小越快，画面越糊
+#define JPEG_QUALITY   80     // 已不用：画面改成从 /frame.rle 取增量帧（留着兼容旧的 niuma_config.h）
 #define FRAME_MS       30     // 两次取图的最小间隔（毫秒）；hub 有新帧才会返回，所以实际帧率跟着 hub 的 fps 走
 #define BRIGHTNESS     160    // 背光 0~255
 #define SHAKE_G        2.3f   // 摇一摇抽鞭子的灵敏度（加速度，单位 g），不想要就改成 99

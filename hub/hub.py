@@ -10,7 +10,9 @@ import asyncio
 import io
 import itertools
 import random
+import struct
 import time
+from collections import OrderedDict
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
@@ -71,6 +73,8 @@ class Hub:
         self.frame = None
         self.frame_id = 0
         self._jpg = (None, None, b"")
+        self.rgb565 = OrderedDict()        # 最近几十帧的 RGB565 画面 {帧号: (240, 320) uint16}，算增量用
+        self.device_stats = {}             # Core2 上报的性能统计
         self.demo = demo
         self.link = None
         self.loop = None
@@ -502,6 +506,84 @@ class Hub:
             self._jpg = (fid, q, data)
         return fid, data
 
+    # ---- Core2 用的增量画面：只传变了的 40x40 小块，RGB565 + 行程压缩，Core2 不用解 JPEG ----
+    RLE_TILE = 40
+
+    def _frame565(self):
+        """当前帧的 RGB565（按帧号缓存最近 40 帧）。"""
+        fid = self.frame_id
+        arr = self.rgb565.get(fid)
+        if arr is None:
+            img = np.asarray((self.frame or self.renderer.render(self.office, time.time())).convert("RGB"), dtype=np.uint16)
+            arr = ((img[:, :, 0] >> 3) << 11) | ((img[:, :, 1] >> 2) << 5) | (img[:, :, 2] >> 3)
+            self.rgb565[fid] = arr
+            while len(self.rgb565) > 40:
+                self.rgb565.popitem(last=False)
+        return fid, arr
+
+    @staticmethod
+    def rle565(px):
+        """一维 uint16 像素 -> [(个数-1, 低字节, 高字节)…]，一段最长 256 个。"""
+        starts = np.concatenate(([0], np.flatnonzero(px[1:] != px[:-1]) + 1))
+        lens = np.diff(np.concatenate((starts, [len(px)])))
+        pieces = (lens + 255) // 256
+        idx = np.repeat(np.arange(len(starts)), pieces)
+        first = np.concatenate(([0], np.cumsum(pieces)[:-1]))
+        ordinal = np.arange(len(idx)) - first[idx]
+        plen = np.where(ordinal == pieces[idx] - 1, lens[idx] - 256 * (pieces[idx] - 1), 256)
+        out = np.empty((len(idx), 3), np.uint8)
+        out[:, 0] = plen - 1
+        v = px[starts[idx]]
+        out[:, 1] = v & 0xFF
+        out[:, 2] = v >> 8
+        return out.tobytes()
+
+    def frame_rle(self, base):
+        """和第 base 帧比，变了的小块按行合并成矩形。base 不在缓存里（或 0）就整帧发。
+        格式：b"NRLE" + <帧号 u32><整帧 u8><矩形数 u16>，每个矩形 <x y w h u16><字节数 u32> + 行程数据（逐行）。"""
+        fid, cur = self._frame565()
+        prev = self.rgb565.get(base) if base else None
+        T = self.RLE_TILE
+        rows, cols = cur.shape[0] // T, cur.shape[1] // T
+        if prev is None:
+            changed = np.ones((rows, cols), bool)
+        else:
+            changed = (prev != cur).reshape(rows, T, cols, T).any(axis=(1, 3))
+        parts = []
+        for ty in range(rows):
+            tx = 0
+            while tx < cols:
+                if not changed[ty, tx]:
+                    tx += 1
+                    continue
+                x0 = tx
+                while tx < cols and changed[ty, tx]:
+                    tx += 1
+                x, y, w = x0 * T, ty * T, (tx - x0) * T
+                data = self.rle565(np.ascontiguousarray(cur[y:y + T, x:x + w]).reshape(-1))
+                parts.append(struct.pack("<HHHHI", x, y, w, T, len(data)) + data)
+        return fid, b"NRLE" + struct.pack("<IBH", fid, prev is None, len(parts)) + b"".join(parts)
+
+    async def h_frame_rle(self, request):
+        """Core2 取画面：?after=<帧号> 等到有新帧再返回（最多 1 秒）；?base=<Core2 屏幕上现在的帧号> 只发变了的部分。"""
+        try:
+            after = int(request.query.get("after", "-1"))
+            base = int(request.query.get("base", "0"))
+        except ValueError:
+            after, base = -1, 0
+        end = time.time() + 1.0
+        while self.frame_id == after and time.time() < end:
+            await asyncio.sleep(0.005)
+        fid, body = self.frame_rle(base)
+        return web.Response(body=body, content_type="application/octet-stream",
+                            headers={"Cache-Control": "no-store", "X-Frame-Id": str(fid)})
+
+    async def h_device_stats(self, request):
+        """Core2 每几秒报一次性能统计（帧率、各环节耗时），出现在 /api/state 的 core2 里，方便远程排查卡顿。"""
+        self.check(request)
+        self.device_stats = dict(await request.json(), ts=round(time.time()))
+        return web.json_response({"ok": True})
+
     async def h_frame_jpg(self, request):
         """给 M5Stack Core2 这类自己联网取画面的小屏：320x240 JPEG，体积比 PNG 小、解码快。
         ?q=1..95 画质，默认 80；响应头 X-Frame-Id 是帧序号。
@@ -542,6 +624,7 @@ class Hub:
         snap["device"] = self.link.stats if self.link else None
         snap["theme"] = self.theme
         snap["https_port"] = self.https_port
+        snap["core2"] = self.device_stats
         return web.json_response(snap)
 
     async def h_index(self, request):
@@ -560,6 +643,8 @@ class Hub:
             web.get("/", self.h_index),
             web.get("/frame.png", self.h_frame),
             web.get("/frame.jpg", self.h_frame_jpg),
+            web.get("/frame.rle", self.h_frame_rle),
+            web.post("/api/device_stats", self.h_device_stats),
             web.get("/stream.mjpg", self.h_stream),
             web.get("/api/state", self.h_state),
             web.post("/api/events", self.h_events),
