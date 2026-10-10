@@ -1,0 +1,53 @@
+# 牛马办公室 hub 配置。第一次运行时会自动复制成 config.toml（不进 git），改 config.toml 即可
+
+[server]
+host = "0.0.0.0"
+port = 8765
+# 手机 / 别的电脑的浏览器只在 https 页面里允许用麦克风（按住牛马说话要用），所以再开一个 https 端口。
+# 证书第一次启动时用 openssl 自动生成（自签，浏览器第一次打开要点「继续访问」）；0 = 不开
+https_port = 8766
+# cert = ""   # 想用自己的证书就填这两个路径
+# key = ""
+# 非空时，Windows 桥接和模拟器的写接口都要带这个 token
+token = ""
+
+[office]
+group = "牛马办公室"          # 顶栏显示的名字，桥接上报后会被覆盖
+humans = ["我", "你", "You", "Me"]      # 把你在 Grok Bot 里的显示名也加进来
+stall_seconds = 180           # 多久没有新消息算"卡住"
+sleep_after = 45              # bot 空闲多久后趴桌睡觉
+show_chat = false             # true = 黑板、气泡、聊天页显示聊天内容；false = 只显示谁在说话和干活统计
+auto_short = true             # 没写在 [names] 里的长名字自动缩短（去掉"游戏/服务端/工程师"等）
+
+# 名字映射：群里的完整名字 = 工位上显示的短名字
+[names]
+# "游戏测试机器人" = "测试"
+# "go游戏服务端" = "Go"
+
+# 云端干活的 bot：它的活是在云上的 Cursor 里干的，画成「头顶一朵云」而不是敲键盘
+# 键是群里的完整名字，值是标签。额度条会挂在它的名牌下面。
+[remote_bots]
+# "go游戏服务端" = "Cursor"
+
+[buttons]
+# 顶部大按钮（滚轮按下）：抽鞭子并往群里发这句话
+dial_text = "大家汇报一下当前进度，卡在哪了？"
+# 左上键：一键鼓励。老板挨个走到每个 bot 面前发大饼，同时往群里发这句话（写多句则随机挑一句）
+encourage_texts = ["大家辛苦了"]
+# 右上键：换肤（不发消息）
+# 点屏幕上的某只牛马（网页模拟器 / Core2 触摸屏）：老板跑过去盯着它，同时私聊它这句话
+poke_text = "干活，我在盯着你"
+cooldown = 3.0                # 两次发送的最小间隔（秒）
+
+[device]
+# Alarmo 的串口。"auto" 按 USB 的 VID:PID 自动找，Debian / 树莓派 / Windows 都不用改；
+# 也可以写死: "COM5"（Windows）、"/dev/ttyACM0"（树莓派/Linux）、带通配符的路径；留空则不连设备，只用网页模拟器
+port = "auto"
+fps = 10
+brightness = 0.8
+
+[render]
+# 画面主题: blueprint 建筑蓝图 | neon 夜班作战室 | barn 牛马牧场 | space 太空舰桥
+#           meeting 视频会议 | tower 加班写字楼 | wheel 牛马摩天轮 | derby KPI 赛马场
+theme = "meeting"
+font = ""                     # 留空自动找 wqy-microhei / wqy-zenhei / Noto Sans CJK

@@ -1,0 +1,443 @@
+"""办公室状态：有哪些牛马、各自在干嘛、谁把活交给了谁。"""
+import time
+from collections import deque
+from datetime import datetime
+from dataclasses import dataclass, field
+
+MAX_BOTS = 6
+
+# 交接动画时间线（秒）
+T_GO, T_DROP, T_BACK = 1.4, 0.5, 1.0
+T_HANDOFF = T_GO + T_DROP + T_BACK
+# 老板发大饼巡视：走到一个 bot 面前 -> 发饼 -> 下一个 -> 回老板位
+T_E_WALK, T_E_GIVE, T_E_BACK = 0.6, 1.0, 0.9
+# 点名盯人：老板跑到这个 bot 面前，盯着它说"干活，我在盯着你"，再跑回去
+T_P_SAY = 2.4
+POKE_REPLY_WINDOW = 1800.0  # 盯过之后这么久里它私聊回的话，直接显示在它头顶
+# 抽鞭子时间线（秒）
+T_WHIP_HIT = 0.45      # 鞭梢落下
+T_WHIP_JUMP = 0.95     # 跳起结束
+T_WHIP_END = 4.5       # 惊慌打字结束
+
+STATUSES = ("typing", "idle", "waiting")
+
+# 自动缩短名字时先去掉这些词（工位名牌只放得下 3~4 个字）
+SHORT_DROP = ("机器人", "服务端", "服务器", "工程师", "记录员", "游戏")
+
+
+def _width(t):
+    return sum(2 if ord(c) > 255 else 1 for c in t)
+
+
+def auto_short(name, limit=8):
+    """没配映射时的兜底：去掉"游戏/服务端/工程师"之类的词；还长（CJK 算 2 宽，超过 8）就截短。"""
+    if _width(name) <= limit:
+        return name
+    out = name
+    for w in SHORT_DROP:
+        if len(out) > len(w):
+            out = out.replace(w, "")
+    out = out.strip(" -_·") or name
+    while _width(out) > limit and len(out) > 1:
+        out = out[:-1]
+    return out
+
+
+def parse_color(v):
+    """'#rrggbb' 或 [r,g,b] -> (r,g,b)；无法识别返回 None。"""
+    try:
+        if isinstance(v, str):
+            v = v.strip().lstrip("#")
+            if len(v) == 6:
+                return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+        elif v is not None and len(v) == 3:
+            return tuple(max(0, min(255, int(x))) for x in v)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+@dataclass
+class Bot:
+    name: str
+    status: str = "idle"
+    status_since: float = 0.0
+    typing_until: float = 0.0      # 收到消息时临时显示打字
+    sticky: bool = False           # 状态由桥接明确给出
+    color: tuple = None            # bot 在 Grok Bot 里的头像颜色 (r,g,b)；没有就按名字生成
+    say_text: str = ""             # 正在说的话（气泡/字幕）
+    say_t0: float = 0.0
+    say_until: float = 0.0
+    say_private: bool = False      # True = 私聊我（悄悄话）
+    say_inplace: bool = False      # 私聊，但它是在回复你的点名：不走过来说悄悄话，头顶直接冒对话框
+    poked_at: float = -1e9         # 上次被点名盯的时间
+    wait_note: str = ""            # 在等你批准什么（Grok Bot 侧边栏里的"需要批准：…"），挂在公告栏上
+
+
+@dataclass
+class Message:
+    ts: float
+    sender: str
+    text: str
+    is_bot: bool
+    private: bool = False
+
+
+@dataclass
+class Handoff:
+    src: int
+    dst: int
+    t0: float
+
+
+@dataclass
+class Office:
+    group: str = "牛马办公室"
+    humans: tuple = ("我", "You", "Me")
+    stall_seconds: float = 180.0
+    sleep_after: float = 45.0
+    bots: list = field(default_factory=list)
+    messages: deque = field(default_factory=lambda: deque(maxlen=80))
+    handoffs: list = field(default_factory=list)
+    whip_t0: float = -1e9
+    usage: dict = field(default_factory=dict)         # 额度：见 set_usage
+    usage_alert_until: float = 0.0
+    remote_state: dict = field(default_factory=dict)  # 云端任务状态 {短名: {"state","since","seen"}}
+    cloud_return: dict = field(default_factory=dict)  # 云端干完、产物回来的时刻 {短名: ts}，用来播"包裹落下"动画
+    remote_timeout: float = 1800.0                    # 超过这么久没再确认还在外包，就当它已经结束
+    remote: dict = field(default_factory=dict)        # 配置里的云端 bot {完整名: 标签}，如 {"go游戏服务端": "Cursor"}
+    enc_t0: float = -1e9               # 一键鼓励（老板发大饼）开始时间
+    enc_order: list = field(default_factory=list)
+    tour_kind: str = "pie"             # pie = 发大饼巡视 | poke = 点名盯一个人
+    poke_text: str = "干活，我在盯着你"
+    last_activity: float = field(default_factory=time.time)
+    toast: tuple = ("", 0.0, "ok")
+    voice: dict = None             # 正在录的语音：{"to": bot 短名或 None(群聊), "state": preparing|recording|sending, "t0", "rec_t0"}
+    view: str = "office"
+    chat_scroll: int = 0
+    bridge_seen: float = 0.0
+    device_online: bool = False
+    show_chat: bool = False        # False = 黑板/气泡/聊天页不显示聊天内容，只显示谁在说话、几个人在干活
+    aliases: dict = field(default_factory=dict)       # 配置里的名字映射 {完整名: 短名}
+    auto_short: bool = True
+    full2short: dict = field(default_factory=dict)    # 已经见过的 {完整名: 短名}
+
+    # ---- 名字映射 ----
+    def short(self, name):
+        """完整名 -> 工位上显示的短名。两个 bot 缩成同一个名字时，后来的保留原名。"""
+        if name in self.full2short:
+            return self.full2short[name]
+        s = self.aliases.get(name) or (auto_short(name) if self.auto_short else name)
+        if s in self.full2short.values():
+            s = name
+        self.full2short[name] = s
+        return s
+
+    def fix_mentions(self, text):
+        """把正文里的 @完整名 换成 @短名，这样交接（@）判断才对得上。"""
+        for full in sorted(self.full2short, key=len, reverse=True):
+            short = self.full2short[full]
+            if full != short:
+                text = text.replace("@" + full, "@" + short)
+        return text
+
+    # ---- 查询 ----
+    def index(self, name):
+        for i, b in enumerate(self.bots):
+            if b.name == name:
+                return i
+        return -1
+
+    def bridge_online(self, now):
+        return now - self.bridge_seen < 45
+
+    def effective_status(self, bot, now):
+        if bot.status == "waiting":
+            return "waiting"
+        if bot.status == "typing" or now < bot.typing_until:
+            return "typing"
+        return "idle"
+
+    def anyone_typing(self, now):
+        return any(self.effective_status(b, now) == "typing" for b in self.bots)
+
+    def silence(self, now):
+        return max(0.0, now - self.last_activity)
+
+    def stalled(self, now):
+        """卡住 = 太久没动静且没人干活。外包给云端的活还在跑时不算卡住。"""
+        return (bool(self.bots) and self.silence(now) > self.stall_seconds
+                and not self.anyone_typing(now) and not self.any_outsourced(now))
+
+    # ---- 外包给云端 ----
+    def outsourced(self, name, now=None):
+        st = self.remote_state.get(name)
+        now = now or time.time()
+        return bool(st and st["state"] == "working" and now - st["seen"] < self.remote_timeout)
+
+    def any_outsourced(self, now=None):
+        return any(self.outsourced(n, now) for n in list(self.remote_state))
+
+    def outsourced_since(self, now=None):
+        """最早的一个还在外包的任务开始了多久（秒）；没有返回 None。"""
+        now = now or time.time()
+        ts = [st["since"] for n, st in self.remote_state.items() if self.outsourced(n, now)]
+        return now - min(ts) if ts else None
+
+    def set_remote(self, name, state, now=None):
+        """桥接上报云端任务状态：working | review | merged | finished | failed | ""（没有任务）。"""
+        now = now or time.time()
+        name = self.short(name)
+        old = self.remote_state.get(name)
+        if not state:
+            self.remote_state.pop(name, None)
+            return
+        if old and old["state"] == state:
+            old["seen"] = now
+            return
+        self.remote_state[name] = {"state": state, "since": now, "seen": now}
+        self.last_activity = now                          # 状态变化算一次动静
+        if state == "working":
+            self.say("已外包给云端", "ok", now)
+        elif state == "failed":
+            self.say("云端运行失败", "err", now)
+        else:
+            self.say("云端干完了", "ok", now)
+            self.cloud_return[name] = now
+            i = self.index(name)
+            if i >= 0:
+                self.bots[i].typing_until = max(self.bots[i].typing_until, now + 6.0)
+
+    # ---- 修改 ----
+    def ensure_bot(self, name, now=None):
+        i = self.index(name)
+        if i >= 0:
+            return i
+        if len(self.bots) >= MAX_BOTS:
+            return -1
+        self.bots.append(Bot(name=name, status_since=now or time.time()))
+        return len(self.bots) - 1
+
+    def set_bots(self, names, now=None):
+        now = now or time.time()
+        # 每一项可以是名字，也可以是 {"name": ..., "color": "#rrggbb"}
+        items = [(n, None) if isinstance(n, str) else (str(n.get("name", "")), parse_color(n.get("color")))
+                 for n in names]
+        items = [(self.short(n), c) for n, c in items if n][:MAX_BOTS]
+        old = {b.name: b for b in self.bots}
+        same = [n for n, _ in items] == [b.name for b in self.bots]
+        self.bots = [old.get(n) or Bot(name=n, status_since=now) for n, _ in items]
+        for b, (_, c) in zip(self.bots, items):
+            if c:
+                b.color = c
+        if not same:
+            self.handoffs.clear()
+
+    def set_status(self, name, status, now=None):
+        now = now or time.time()
+        name = self.short(name)
+        if status not in STATUSES:
+            status = "idle"
+        i = self.ensure_bot(name, now)
+        if i < 0:
+            return
+        b = self.bots[i]
+        b.sticky = True
+        if b.status != status:
+            b.status, b.status_since = status, now
+            if status == "typing":
+                self.last_activity = now
+
+    def set_note(self, name, text):
+        """某个 bot 在等你批准的事（空字符串 = 没有）。"""
+        i = self.index(self.short(name))
+        if i >= 0:
+            self.bots[i].wait_note = " ".join(str(text or "").split())[:160]
+
+    def notices(self, now):
+        """公告栏：[(bot 下标, 文字)]，在等你批准的 bot 各一条。"""
+        out = []
+        for i, b in enumerate(self.bots):
+            if self.effective_status(b, now) == "waiting":
+                out.append((i, b.wait_note or "等你批准"))
+        return out
+
+    def add_message(self, sender, text, now=None, private=False):
+        now = now or time.time()
+        is_human = sender in self.humans
+        if not is_human:
+            sender = self.short(sender)
+        text = self.fix_mentions(" ".join(str(text).split()))
+        i = -1 if is_human else self.ensure_bot(sender, now)
+        self.messages.append(Message(now, sender, text, i >= 0, bool(private)))
+        self.chat_scroll = 0
+        if i < 0:
+            return
+        self.last_activity = now
+        b = self.bots[i]
+        # 被点名后私聊回的话是回给你的，就算不展示聊天内容也照样显示原文
+        inplace = bool(private) and now - b.poked_at < POKE_REPLY_WINDOW
+        show = self.show_chat or inplace
+        b.say_text, b.say_t0, b.say_private, b.say_inplace = (text if show else "…"), now, bool(private), inplace
+        b.say_until = now + (min(10.0 if inplace else 8.0, 3.0 + len(text) / 8.0) if show else 2.5)
+        if private:
+            return                         # 悄悄话不算群里的动作，也不触发交接
+        b.typing_until = now + 4.0
+        if not b.sticky:
+            b.status_since = now
+        # 消息里 @ 了别的 bot，就当作交接
+        for j, other in enumerate(self.bots):
+            if j != i and ("@" + other.name) in text:
+                self.handoff(sender, other.name, now)
+
+    def handoff(self, src, dst, now=None):
+        now = now or time.time()
+        i, j = self.ensure_bot(self.short(src), now), self.ensure_bot(self.short(dst), now)
+        if i < 0 or j < 0 or i == j:
+            return
+        if any(h.src == i and now - h.t0 < T_HANDOFF for h in self.handoffs):
+            return
+        self.handoffs.append(Handoff(i, j, now))
+        self.last_activity = now
+        self.bots[j].typing_until = max(self.bots[j].typing_until, now + T_GO + T_DROP + 5.0)
+
+    def encourage(self, now=None):
+        """老板挨个走到每个 bot 面前发大饼。已经在发就不重复开始。返回是否开始。"""
+        now = now or time.time()
+        if self.tour_at(now) or not self.bots:
+            return False
+        self.enc_t0, self.enc_order, self.tour_kind = now, list(range(len(self.bots))), "pie"
+        self.last_activity = now
+        return True
+
+    def poke(self, i, now=None):
+        """老板跑到第 i 个 bot 面前盯着它。已经在巡视就不开始。返回是否开始。"""
+        now = now or time.time()
+        if self.tour_at(now) or not 0 <= i < len(self.bots):
+            return False
+        self.enc_t0, self.enc_order, self.tour_kind = now, [i], "poke"
+        self.bots[i].poked_at = now
+        self.last_activity = now
+        return True
+
+    def tour_at(self, now):
+        """当前巡视进度：None 或 {"stage": walk|give|back, "k": 第几个, "bot": bot 下标, "p": 0..1, "kind": pie|poke}"""
+        tr = self._tour_at(now)
+        if tr:
+            tr["kind"] = self.tour_kind
+            if self.tour_kind == "poke":
+                tr["say"] = self.poke_text
+        return tr
+
+    def _tour_at(self, now):
+        n = len(self.enc_order)
+        t = now - self.enc_t0
+        if t < 0 or n == 0:
+            return None
+        give = T_P_SAY if self.tour_kind == "poke" else T_E_GIVE
+        per = T_E_WALK + give
+        if t < n * per:
+            k = int(t // per)
+            r = t - k * per
+            bot = self.enc_order[k]
+            if bot >= len(self.bots):
+                return None
+            if r < T_E_WALK:
+                p = r / T_E_WALK
+                return {"stage": "walk", "k": k, "bot": bot, "p": p * p * (3 - 2 * p)}
+            return {"stage": "give", "k": k, "bot": bot, "p": (r - T_E_WALK) / give}
+        tb = t - n * per
+        if tb < T_E_BACK:
+            p = tb / T_E_BACK
+            return {"stage": "back", "k": n, "bot": self.enc_order[-1], "p": p * p * (3 - 2 * p)}
+        return None
+
+    def cheering(self, i, now):
+        tr = self.tour_at(now)
+        return bool(tr and tr["kind"] == "pie" and tr["stage"] == "give" and tr["bot"] == i)
+
+    def stared(self, i, now):
+        """正被老板盯着（点名）。"""
+        tr = self.tour_at(now)
+        return bool(tr and tr["kind"] == "poke" and tr["stage"] == "give" and tr["bot"] == i)
+
+    # ---- 额度 ----
+    USAGE_LABELS = (("grok", "Grok Bot 每周"), ("cursor", "Cursor 模型"), ("other", "其他模型"))
+
+    def set_usage(self, ev, now=None):
+        """桥接上报的额度。ev = {ok, error, plan, grok:{pct, reset}, cursor, other, total}。
+        某项首次越过 80% / 95% 时弹提示；Grok Bot 每周额度到 100% 时 quota_blocked 为真。"""
+        now = now or time.time()
+        old = self.usage if self.usage.get("ok") else {}
+        new = {"ok": bool(ev.get("ok")), "error": str(ev.get("error", ""))[:60], "ts": now,
+               "plan": str(ev.get("plan", "")), "total": ev.get("total")}
+        g = ev.get("grok") or {}
+        reset = None
+        if g.get("reset"):
+            try:
+                reset = datetime.fromisoformat(str(g["reset"]).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        new["grok"] = {"pct": g.get("pct"), "reset": reset}
+        new["cursor"], new["other"] = ev.get("cursor"), ev.get("other")
+        self.usage = new
+        if not new["ok"]:
+            return
+        for key, label in self.USAGE_LABELS:
+            cur = new["grok"]["pct"] if key == "grok" else new.get(key)
+            before = (old.get("grok", {}).get("pct") if key == "grok" else old.get(key)) if old else None
+            if cur is None or before is None:
+                continue
+            for th in (95, 80):
+                if before < th <= cur:
+                    self.say(f"{label}额度已用 {cur:.0f}%", "warn" if th == 80 else "err", now)
+                    self.usage_alert_until = now + 8.0
+                    break
+
+    def usage_pct(self, key):
+        u = self.usage
+        if not u.get("ok"):
+            return None
+        return u["grok"]["pct"] if key == "grok" else u.get(key)
+
+    def quota_blocked(self):
+        p = self.usage_pct("grok")
+        return p is not None and p >= 100
+
+    def remote_label(self, name):
+        """name 是工位上的短名；返回云端标签（如 "Cursor"），不是云端 bot 返回 None。"""
+        for full, label in self.remote.items():
+            if self.short(full) == name:
+                return label or "云"
+        return None
+
+    def whip(self, now=None):
+        self.whip_t0 = now or time.time()
+
+    def say(self, text, kind="ok", now=None):
+        self.toast = (text, now or time.time(), kind)
+
+    def tick(self, now):
+        self.handoffs = [h for h in self.handoffs if now - h.t0 < T_HANDOFF]
+        # 桥接掉线后，它之前报的状态不可信了
+        if self.bridge_seen and not self.bridge_online(now):
+            for b in self.bots:
+                if b.sticky and b.status != "idle":
+                    b.status, b.status_since, b.sticky = "idle", now, False
+
+    def snapshot(self, now):
+        return {
+            "group": self.group,
+            "silence": round(self.silence(now)),
+            "stalled": self.stalled(now),
+            "bridge_online": self.bridge_online(now),
+            "device_online": self.device_online,
+            "view": self.view,
+            "bots": [{"name": b.name, "status": self.effective_status(b, now)} for b in self.bots],
+            "show_chat": self.show_chat,
+            "usage": self.usage,
+            "remote": {n: st["state"] for n, st in self.remote_state.items()},
+            "notices": [{"bot": self.bots[i].name, "text": t} for i, t in self.notices(now)],
+            "voice": self.voice,
+            "messages": [{"sender": m.sender, "text": m.text if self.show_chat else "…"} for m in list(self.messages)[-10:]],
+        }

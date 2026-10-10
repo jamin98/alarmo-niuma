@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>牛马办公室模拟器</title>
+<style>
+:root{--bg:#14161c;--fg:#e8e8ee;--mut:#8b90a0;--card:#1e2230;--acc:#f2994a}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at 50% 0,#252a3a,var(--bg) 60%);color:var(--fg);font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif;min-height:100vh}
+main{max-width:760px;margin:0 auto;padding:16px 16px 40px}
+h1{font-size:16px;margin:0 0 4px;font-weight:600}
+.hint{color:var(--mut);font-size:12px;margin-bottom:18px}
+kbd{background:#2a3044;border:1px solid #3a4260;border-radius:4px;padding:0 5px;font:11px ui-monospace,monospace}
+
+/* ---------- 闹钟本体 ---------- */
+.stage{display:flex;justify-content:center;perspective:1400px}
+.alarmo{position:relative;width:min(560px,100%);padding:84px 44px 56px;border-radius:64px 64px 52px 52px;
+  background:linear-gradient(160deg,#fbfbf8,#e4e4de 55%,#cfcfc7);
+  box-shadow:inset 0 2px 0 #fff,inset 0 -10px 22px rgba(0,0,0,.14),0 40px 60px -20px rgba(0,0,0,.7),0 6px 0 #b9b9b0}
+/* 顶面 */
+.top{position:absolute;left:0;right:0;top:0;height:84px;display:flex;align-items:center;justify-content:center;gap:22px;padding:0 44px}
+.cap{height:30px;border-radius:15px;border:0;cursor:pointer;color:#555;font:600 11px "Microsoft YaHei",sans-serif;letter-spacing:1px;
+  background:linear-gradient(#f6f6f2,#d6d6ce);box-shadow:0 3px 0 #a9a9a0,0 5px 6px rgba(0,0,0,.25),inset 0 1px 0 #fff;transition:transform .05s,box-shadow .05s;padding:0 16px;flex:none}
+.cap:active,.cap.down{transform:translateY(3px);box-shadow:0 0 0 #a9a9a0,inset 0 2px 4px rgba(0,0,0,.25)}
+/* 大按钮（可转可按） */
+.dial{flex:1;max-width:300px;height:54px;border-radius:27px;position:relative;cursor:pointer;touch-action:none;user-select:none;overflow:hidden;
+  background:linear-gradient(#ff6a58,#d9402f);box-shadow:0 5px 0 #8f2a1e,0 9px 10px rgba(0,0,0,.35),inset 0 2px 0 rgba(255,255,255,.45);transition:transform .06s,box-shadow .06s}
+.dial.down{transform:translateY(5px);box-shadow:0 0 0 #8f2a1e,inset 0 3px 6px rgba(0,0,0,.35)}
+.dial .ridges{position:absolute;inset:0;background:repeating-linear-gradient(90deg,rgba(0,0,0,.16) 0 3px,transparent 3px 14px);background-position:0 0}
+.dial .lab{position:absolute;inset:0;display:grid;place-items:center;color:#fff;font:700 14px "Microsoft YaHei",sans-serif;letter-spacing:3px;text-shadow:0 1px 2px rgba(0,0,0,.4);pointer-events:none}
+/* 屏幕 */
+.bezel{background:#16181d;border-radius:26px;padding:18px;box-shadow:inset 0 3px 10px #000,0 1px 0 #fff}
+.bezel img{cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;display:block;width:100%;aspect-ratio:4/3;image-rendering:pixelated;border-radius:8px;background:#000}
+.foot{position:absolute;left:0;right:0;bottom:16px;text-align:center;color:#a3a39a;font:600 11px system-ui;letter-spacing:6px}
+.led{position:absolute;right:34px;bottom:20px;width:8px;height:8px;border-radius:50%;background:#444}
+.led.on{background:#ff4b3a;box-shadow:0 0 8px #ff4b3a}
+
+/* ---------- 控制台 ---------- */
+.panel{margin-top:30px;background:var(--card);border:1px solid #2c3347;border-radius:12px;padding:12px 14px}
+.panel h2{font-size:12px;color:var(--mut);margin:0 0 8px;font-weight:600;letter-spacing:1px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button.b{background:#262c40;color:var(--fg);border:1px solid #333a4d;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+button.b.on{background:var(--acc);color:#201000;border-color:var(--acc);font-weight:600}
+input[type=text]{flex:1;min-width:90px;background:#12151f;color:var(--fg);border:1px solid #333a4d;border-radius:8px;padding:7px}
+pre{background:#12151f;padding:10px;border-radius:8px;overflow:auto;font-size:12px;color:var(--mut);max-height:220px;margin:8px 0 0}
+details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:12px}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#000c;border:1px solid #444;padding:6px 14px;border-radius:20px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+</style></head><body><main>
+<h1>牛马办公室 · Alarmo 模拟器</h1>
+<div class="hint">
+  顶部：<b>红色大按钮</b> 可按下 / 左右拖动或滚轮转动，左边「鼓励」(发一句夸奖)、右边「换肤」。
+  <b>点画面上的某只牛马</b>：老板跑过去盯着它，并私聊它「干活，我在盯着你」（会真的发出去）。
+  <b>按住牛马</b>说话私聊它，<b>按住「我」</b>说话发到群里：录的是你这台设备的麦克风，松手发送，拖出画面松手取消；Grok Bot 听写成文字发出去。手机 / 别的电脑要用 https 地址打开本页。<br>
+  键盘：<kbd>空格</kbd> 大按钮　<kbd>E</kbd> 鼓励　<kbd>T</kbd> 换肤　<kbd>←</kbd><kbd>→</kbd> 转动（看聊天记录）
+</div>
+
+<div class="stage"><div class="alarmo">
+  <div class="top">
+    <button class="cap" id="bBack" title="一键鼓励：往群里发一句夸奖 (E)">鼓励</button>
+    <div class="dial" id="dial" title="按下：抽鞭子 (空格)　拖动/滚轮：转动"><div class="ridges" id="ridges"></div><div class="lab">抽 鞭 子</div></div>
+    <button class="cap" id="bNotify" title="换肤：切换下一个主题 (T)">换肤</button>
+  </div>
+  <div class="bezel"><img id="scr" alt="Alarmo 画面"></div>
+  <div class="foot">ALARMO</div><div class="led" id="led"></div>
+</div></div>
+
+<div class="panel"><h2>主题</h2><div class="row" id="themes">
+  <button class="b" data-t="blueprint">A 蓝图</button><button class="b" data-t="neon">B 夜班作战室</button>
+  <button class="b" data-t="barn">C 牛马牧场</button><button class="b" data-t="space">D 太空舰桥</button>
+  <button class="b" data-t="meeting">E 视频会议</button><button class="b" data-t="tower">F 加班写字楼</button>
+  <button class="b" data-t="wheel">G 牛马摩天轮</button><button class="b" data-t="derby">H KPI 赛马场</button></div>
+  <div class="row" style="margin-top:10px"><label><input type="checkbox" id="showChat"> 显示聊天内容（关闭时黑板和气泡只显示谁在说话、几人干活）</label></div></div>
+
+<div class="panel"><h2>注入消息</h2>
+<form class="row" onsubmit="say(event)"><input type="text" id="who" placeholder="发言人" value="后端" style="flex:1"><input type="text" id="txt" placeholder="消息，写 @名字 触发交接" style="flex:4">
+<label><input type="checkbox" id="priv"> 私聊我</label><button class="b">发送</button></form>
+<details><summary>hub 状态</summary><pre id="st"></pre></details></div>
+<div class="toast" id="toast"></div>
+</main><script>
+const $ = id => document.getElementById(id);
+let tok = new URLSearchParams(location.search).get('token') || '';
+try { if (tok) localStorage.setItem('niuma_token', tok); else tok = localStorage.getItem('niuma_token') || ''; } catch (e) {}
+/* 写接口带口令；返回 401 就弹窗问一次口令，记在浏览器里，然后重试 */
+async function post(u, b) {
+  const go = () => fetch(u, {method:'POST', headers:{'Content-Type':'application/json','X-Token':tok}, body:JSON.stringify(b)});
+  let r = await go();
+  if (r.status === 401) {
+    const t = prompt('hub 设置了口令，请输入（hub/config.toml 里的 [server] token）：');
+    if (t) { tok = t.trim(); try { localStorage.setItem('niuma_token', tok); } catch (e) {} r = await go(); }
+    if (r.status === 401) toast('口令不对，操作没有生效');
+  }
+  return r;
+}
+const btn = b => post('/api/button', {button:b});
+const toast = s => {const t=$('toast');t.textContent=s;t.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('show'),1200)};
+
+/* 转动：累计角度，每 STEP 像素当作 30° */
+let ridgeX = 0;
+function rotate(deg){ post('/api/button',{dial:deg}); ridgeX += deg/30*14; $('ridges').style.backgroundPosition = ridgeX+'px 0'; }
+
+/* 大按钮：按下（没拖动）= 点击；拖动 = 转动 */
+const dial = $('dial'); let drag = null;
+dial.addEventListener('pointerdown', e => { dial.setPointerCapture(e.pointerId); dial.classList.add('down'); drag = {x:e.clientX, moved:false, acc:0}; });
+dial.addEventListener('pointermove', e => {
+  if(!drag) return; const dx = e.clientX - drag.x; drag.x = e.clientX; drag.acc += dx;
+  if(Math.abs(drag.acc) > 6) drag.moved = true;
+  while(Math.abs(drag.acc) >= 14){ const s = Math.sign(drag.acc); rotate(30*s); drag.acc -= 14*s; }
+});
+const up = () => { if(!drag) return; dial.classList.remove('down'); if(!drag.moved){ btn('dial'); toast('大按钮：抽鞭子'); } drag = null; };
+dial.addEventListener('pointerup', up); dial.addEventListener('pointercancel', () => {dial.classList.remove('down'); drag=null;});
+dial.addEventListener('wheel', e => { e.preventDefault(); rotate(e.deltaY > 0 ? 30 : -30); }, {passive:false});
+
+$('bBack').onclick = () => { btn('back'); toast('一键鼓励'); };
+$('bNotify').onclick = () => { btn('notify'); toast('换肤'); };
+
+const flash = el => { el.classList.add('down'); setTimeout(() => el.classList.remove('down'), 120); };
+addEventListener('keydown', e => {
+  if(/INPUT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  if(e.key === ' ')          { e.preventDefault(); flash(dial); btn('dial'); toast('大按钮：抽鞭子'); }
+  else if(e.key === 't' || e.key === 'T') { flash($('bNotify')); btn('notify'); toast('换肤'); }
+  else if(e.key === 'e' || e.key === 'E') { flash($('bBack')); btn('back'); toast('一键鼓励'); }
+  else if(e.key === 'ArrowLeft')  { rotate(-30); }
+  else if(e.key === 'ArrowRight') { rotate(30); }
+});
+
+/* 点画面上的牛马 = 点名盯它（私聊它一句）；按住牛马 = 说话私聊它，按住「我」= 说话发到群里。
+   录音在这台设备上进行（手机 / 电脑的麦克风），松手把 16kHz WAV 传给 hub；桥接把它放进 Grok Bot 那台电脑的
+   虚拟麦克风，由 Grok 自己听写成文字发出去。拖出画面再松手 = 取消。浏览器只在 https 页面里给麦克风。 */
+const scr = $('scr');
+scr.draggable = false;
+scr.addEventListener('contextmenu', e => e.preventDefault());
+const at = (e) => { const r = scr.getBoundingClientRect();
+  return {x: Math.round((e.clientX - r.left) / r.width * 320), y: Math.round((e.clientY - r.top) / r.height * 240),
+          inside: e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom}; };
+
+let micStream = null, actx = null, httpsPort = 0;
+function micUsable() { return !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia); }
+function httpsHint() {
+  return httpsPort ? `按住说话要用 https 打开：https://${location.hostname}:${httpsPort}` : '按住说话要用 https 打开本页（hub 的 [server] https_port）';
+}
+async function micReady() {
+  if (!micStream) micStream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}});
+  return micStream;
+}
+function startCapture(stream) {
+  const src = actx.createMediaStreamSource(stream), proc = actx.createScriptProcessor(4096, 1, 1), chunks = [];
+  proc.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(proc); proc.connect(actx.destination);
+  return {stop() { proc.disconnect(); src.disconnect(); return toWav(chunks, actx.sampleRate); }};
+}
+function toWav(chunks, rate) {                       // 降到 16kHz 单声道 16 位
+  const n = chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(n); let o = 0;
+  for (const c of chunks) { all.set(c, o); o += c.length; }
+  const out = 16000, ratio = rate / out, m = Math.floor(n / ratio), buf = new ArrayBuffer(44 + m * 2), v = new DataView(buf);
+  const str = (p, t) => { for (let i = 0; i < t.length; i++) v.setUint8(p + i, t.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + m * 2, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, out, true); v.setUint32(28, out * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, m * 2, true);
+  for (let i = 0; i < m; i++) {
+    const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.min(n, Math.floor((i + 1) * ratio))); let sum = 0;
+    for (let k = a; k < b; k++) sum += all[k];
+    v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, sum / (b - a))) * 32767, true);
+  }
+  return new Blob([buf], {type: 'audio/wav'});
+}
+async function upload(blob) {
+  const r = await fetch('/api/voice/clip', {method: 'POST', headers: {'Content-Type': 'audio/wav', 'X-Token': tok}, body: blob});
+  const j = r.ok ? await r.json() : {ok: false, error: 'hub ' + r.status};
+  toast(j.ok ? '松手：交给 Grok 听写发送' : '没发出去：' + j.error);
+}
+
+let hold = null;
+scr.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault(); scr.setPointerCapture(e.pointerId);
+  const p = at(e);
+  if (micUsable()) {                                  // 手势里先把声音环境和麦克风准备好（第一次会弹授权）
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    actx.resume();
+    micReady().catch(() => {});
+  }
+  hold = {p, voice: false, cap: null, timer: setTimeout(async () => {
+    const h = hold; if (!h) return;
+    if (!micUsable()) { toast(httpsHint()); return; }
+    h.voice = true;
+    const r = await post('/api/voice', {action: 'start', x: p.x, y: p.y});
+    const j = r.ok ? await r.json() : {};
+    if (!j.ok) { h.voice = false; toast(j.error || '没按中牛马或「我」'); return; }
+    try {
+      const stream = await micReady();
+      if (hold !== h) { post('/api/voice', {action: 'cancel'}); return; }   // 麦克风还没好就松手了
+      h.cap = startCapture(stream);
+      toast('录音中 → ' + j.to + '，松手发送');
+      h.limit = setTimeout(() => finish(h, true), 60000);                  // 最长 60 秒
+    } catch (err) { h.voice = false; post('/api/voice', {action: 'cancel'}); toast('拿不到麦克风：' + err.name); }
+  }, 350)};
+});
+function finish(h, send) {
+  if (h.done) return; h.done = true; clearTimeout(h.timer); clearTimeout(h.limit);
+  if (hold === h) hold = null;
+  if (!h.voice) return false;
+  if (!h.cap) { post('/api/voice', {action: 'cancel'}); return true; }
+  const wav = h.cap.stop();
+  if (send) upload(wav); else { post('/api/voice', {action: 'cancel'}); toast('已取消'); }
+  return true;
+}
+scr.addEventListener('pointerup', async e => {
+  const h = hold; if (!h) return;
+  if (finish(h, at(e).inside) !== false) return;
+  const r = await post('/api/poke', h.p); if (!r.ok) return; const j = await r.json();
+  if (j.bot) toast((j.ok ? '盯着 ' : '没盯成：') + j.bot);
+});
+scr.addEventListener('pointercancel', () => { if (hold) finish(hold, false); });
+
+/* 主题 */
+document.querySelectorAll('#themes button').forEach(b => b.onclick = () => post('/api/theme', {theme:b.dataset.t}));
+$('showChat').onchange = e => post('/api/options', {show_chat: e.target.checked});
+function markTheme(t){ document.querySelectorAll('#themes button').forEach(b => b.classList.toggle('on', b.dataset.t === t)); }
+
+function say(e){ e.preventDefault(); post('/api/events?from=bot',{type:'message',sender:$('who').value,text:$('txt').value,private:$('priv').checked}); $('txt').value=''; }
+
+/* 画面：一个 MJPEG 推流连接，画面变了服务端才推；页面在后台时断开，回来再连 */
+const img = $('scr');
+function connect(){ img.src = '/stream.mjpg?t=' + Date.now(); }
+img.onload = () => $('led').classList.add('on');
+img.onerror = () => { $('led').classList.remove('on'); if(!document.hidden) setTimeout(connect, 1000); };
+document.addEventListener('visibilitychange', () => { if(document.hidden){ img.removeAttribute('src'); $('led').classList.remove('on'); } else connect(); });
+connect();
+setInterval(() => document.hidden || fetch('/api/state').then(r => r.json()).then(j => { $('st').textContent = JSON.stringify(j, null, 1); if(j.theme) markTheme(j.theme); httpsPort = j.https_port || 0; if(document.activeElement !== $('showChat')) $('showChat').checked = !!j.show_chat; }).catch(() => {}), 1000);
+</script></body></html>

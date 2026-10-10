@@ -1,0 +1,39 @@
+# Windows 桥接配置（和 Grok Bot 桌面端装在同一台电脑上）。第一次运行时会自动复制成 config.toml（不进 git），改 config.toml 即可
+
+hub = "http://127.0.0.1:8765"          # hub 地址（本机测试用 127.0.0.1，上 Debian 后改成它的 IP）
+token = ""                          # 和 hub/config.toml 里的 token 一致
+
+window_title = "Grok Bot"           # Grok Bot 窗口标题里包含的文字
+group = ""                           # 留空 = 用当前打开的聊天标题；未命名群聊的标题就是"成员1、成员2"
+bots = []                           # 群里各 bot 的名字，按想要的工位顺序，最多 6 个，例如 ["架构", "后端"]
+me = "你的显示名"                         # 你自己的显示名（群标题里的这个名字不算 bot；聊天记录里的"你"也算你）
+
+poll_seconds = 2                    # 多久读一次界面
+
+# 读头像颜色，让工位上的牛马和 Grok Bot 里 bot 的头像同色（截窗口取主色，窗口被挡住也行，不能最小化）
+avatar_colors = true
+
+# 云端 bot（活外包给云上的 Cursor 干）的完整名字。它的聊天页里能读到云端任务行
+# （工作中 / 待审核 / 已合并 / 已完成 / 运行失败）。留空 = 不读云端任务状态
+cloud_owner = ""                    # 例如 "go游戏服务端"
+# 云端任务状态多久问一次 Cursor（秒）。需要 secrets.toml 里的 Cookie
+cloud_poll_seconds = 20
+# 只把这些云端任务算作"外包"（填 bcId 或直接粘任务网址）；别的任务在跑不算。留空 [] = 账号下所有任务都算
+cloud_agents = []                   # 例如 ["https://cursor.com/agents/bc-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
+
+# 额度多久查一次（分钟）。需要 secrets.toml 里的 Cursor 登录 Cookie；设成 0 关闭
+usage_poll_minutes = 5
+
+# 按住牛马说话：录音会被放进这个播放设备（虚拟声卡的输入端），Grok Bot 把它当麦克风听写。
+# 装 VB-CABLE 后默认就叫 "CABLE Input"；Grok Bot 的麦克风要选它的录音端 "CABLE Output"
+voice_device = "CABLE Input"
+
+# 手动指定某个 bot 的颜色（优先于自动读取），键是群里的完整名字
+# [colors]
+# "游戏测试机器人" = "#a27952"
+
+[send]
+# search: 先按 Ctrl+K 搜 group 回车切到群聊，再发消息（group 留空时自动退化成 none）
+# none:   不切换，直接发到当前打开的会话（你保证窗口一直停在群聊）
+switch = "search"
+restore_focus = true                # 发完把焦点还给原来的窗口

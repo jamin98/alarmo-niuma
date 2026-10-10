@@ -1,0 +1,15 @@
+[Unit]
+Description=Niuma Office hub (Alarmo display for Grok Bot group chat)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/alarmo-niuma/hub
+ExecStart=/usr/bin/python3 hub.py
+Restart=always
+RestartSec=3
+DynamicUser=yes
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target

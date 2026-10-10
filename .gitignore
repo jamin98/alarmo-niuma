@@ -1,0 +1,18 @@
+# 本机配置和凭据（仓库里只放 *.example.*）
+hub/config.toml
+bridge/config.toml
+bridge/secrets.toml
+m5core2/include/config.h
+hub/certs/
+
+# 编译产物和下载的上游代码
+m5core2/.pio/
+firmware/upstream/
+firmware/build/
+firmware/a.bin
+firmware/MarkFile
+
+# 运行时生成
+__pycache__/
+*.pyc
+bridge/uia_dump.txt
