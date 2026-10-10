@@ -8,7 +8,8 @@
 //
 // 操作：
 //   屏幕下方三个触摸键   左 = 一键鼓励    中 = 显示 / 隐藏聊天记录（在聊天记录页里 = 回到工位）    右 = 换肤
-//   在屏幕上上下滑动      转滚轮：进入聊天记录并翻页（按「中」回到工位）
+//   按住中键              按住期间看历史聊天记录（可以同时在屏幕上滑动翻页），松手回到工位
+//   在屏幕上上下滑动     转滚轮：进入聊天记录并翻页（按「中」回到工位）
 //   点一下屏幕上的某只牛马  点名：老板跑过去盯着它，并私聊它一句（hub 的 [buttons] poke_text）
 //   按住某只牛马 / 按住「我」 说话私聊它 / 发到群里：用 Core2 自带的麦克风录，松手把录音传给 hub，
 //                            由 Grok Bot 听写成文字发出去（跑 Grok Bot 的电脑上要装虚拟麦克风，见 README）
@@ -20,6 +21,7 @@
 #include <esp32/rom/miniz.h>                    // ROM 里自带的 tinfl：解 hub 推过来的 deflate 帧
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -35,7 +37,7 @@
 #endif
 
 static constexpr size_t FRAME_MAX = 256 * 1024;   // 一帧最坏情况（每个像素都和旁边不一样）约 230KB
-static constexpr const char *FW_VERSION = "2026.10.10-deflate";   // 报给 hub，排查时确认烧的是哪一版
+static constexpr const char *FW_VERSION = "2026.10.10-slownet";   // 报给 hub，排查时确认烧的是哪一版
 
 static M5Canvas canvas(&M5.Display);          // 屏幕上这一帧的完整副本：叠提示、恢复画面都靠它
 
@@ -53,6 +55,7 @@ static volatile bool needKeyframe = true;     // 下一帧要整帧（刚开机�
 static bool awaitKey = true;                  // 主循环在等整帧：之前的增量帧都不画
 static bool lcdStale = false;                 // 屏幕上画了别的（状态页、REC），下一帧用 canvas 整屏恢复
 static bool noticeOnScreen = false;
+static bool noticeDirty = false;              // 提示换了内容，或者新的一帧可能盖掉了它：要重画
 static volatile uint32_t netFails = 0;
 static uint32_t lastFrameAt = 0;
 // 性能统计（每 3 秒报给 hub）
@@ -71,6 +74,7 @@ static void pollInput();                      // 取画面时也要读输入，�
 static void showNotice(const String &s, uint32_t ms = 2000) {
     notice = s;
     noticeUntil = millis() + ms;
+    noticeDirty = true;
 }
 
 static void centerText(const String &s, int y, uint16_t color = TFT_WHITE) {
@@ -360,17 +364,26 @@ static void drawNotice() {
     M5.Display.drawString(notice, 160, 217);
 }
 
-// 往 hub 的某个接口 POST 一段 JSON。reply 不为空时带回响应内容。
-static bool postHub(const char *path, const String &body, String *reply = nullptr) {
-    HTTPClient http;
+static int postOnce(HTTPClient &http, const char *path, const String &body, String *reply) {
     http.setConnectTimeout(1500);
     http.setTimeout(2500);
-    if (!http.begin(S.hub + path)) return false;
+    if (!http.begin(S.hub + path)) return HTTPC_ERROR_CONNECTION_REFUSED;
     http.addHeader("Content-Type", "application/json");
     if (S.token.length()) http.addHeader("X-Token", S.token);
     int code = http.POST(body);
     if (reply && code == 200) *reply = http.getString();
-    http.end();
+    http.end();                               // keep-alive 时连接留着，下次直接用
+    return code;
+}
+
+// 往 hub 的某个接口 POST 一段 JSON。reply 不为空时带回响应内容。
+// 传了 conn 就复用它的连接（keep-alive）：网络差时每次重新建 TCP 连接是最慢的一步，往往比请求本身还慢。
+static bool postHub(const char *path, const String &body, String *reply = nullptr, HTTPClient *conn = nullptr) {
+    HTTPClient local;
+    HTTPClient &http = conn ? *conn : local;
+    int code = postOnce(http, path, body, reply);
+    if (conn && code <= HTTPC_ERROR_SEND_HEADER_FAILED && code >= HTTPC_ERROR_CONNECTION_LOST)
+        code = postOnce(http, path, body, reply);   // 留着的连接已经被 hub 关了（空闲太久）：重新连一次
     if (code != 200) {                        // 可能在后台任务里：只记下来，主循环去显示
         hubErrCode = code;
         hubErr = true;
@@ -380,26 +393,56 @@ static bool postHub(const char *path, const String &body, String *reply = nullpt
 
 // 按键、点名、滑动、性能统计都放到后台任务（core 0）里发：一次 POST 要 100ms 以上，
 // 以前在主循环里发，按一下键画面就停一下（换肤时最明显）。按顺序一条条发，队列满了就丢。
+// 网络差时一次 POST 要好几秒，按了几下就会排队、过很久才一下下生效（比如连着换好几次肤），所以：
+//   - 同一种操作上一下还没发完，再按就不发了（kind，见 processInput）；
+//   - 在队列里等太久（REQ_STALE_MS）的直接丢掉，不在用户已经不想要的时候才生效；
+//   - 一直用同一个连接发。
+static constexpr uint32_t REQ_STALE_MS = 2000;
 struct HubReq {
     char path[24];
     char body[232];
+    uint32_t at;                              // 什么时候按的
+    int8_t kind;                              // 哪种操作（EvType），-1 = 不算（性能统计）
+    bool keep;                                // 再旧也要发（比如「松开中键」，不发 hub 就一直停在聊天记录页）
 };
 static QueueHandle_t reqQ = nullptr;
 static volatile bool sending = false;         // 后台任务正在发：进设置前要等它发完（设置会改 hub 地址）
+static std::atomic<uint32_t> pendingKinds{0}; // 每种操作一位：还在排队或正在发
+static volatile uint32_t staleDropped = 0;    // 因为等太久丢掉了几个，主循环去提示
+static volatile bool connReset = false;       // 改了 hub 地址：留着的连接作废
 
-static void postAsync(const char *path, const String &body) {
+static bool postAsync(const char *path, const String &body, int kind = -1, bool keep = false) {
     HubReq r;
     strlcpy(r.path, path, sizeof r.path);
     strlcpy(r.body, body.c_str(), sizeof r.body);
-    if (reqQ) xQueueSend(reqQ, &r, 0);
+    r.at = millis();
+    r.kind = kind;
+    r.keep = keep;
+    if (kind >= 0) pendingKinds |= 1u << kind;      // 先标上再入队：后台任务可能马上发完并清掉它
+    if (reqQ && xQueueSend(reqQ, &r, 0) == pdTRUE) return true;
+    if (kind >= 0) pendingKinds &= ~(1u << kind);
+    return false;
 }
 
 static void sendTask(void *) {
     HubReq r;
+    HTTPClient http;
+    http.setReuse(true);
     for (;;) {
         if (xQueueReceive(reqQ, &r, portMAX_DELAY) != pdTRUE) continue;
         sending = true;
-        if (!netPause && WiFi.status() == WL_CONNECTED) postHub(r.path, r.body);
+        if (connReset) {
+            connReset = false;
+            http.setReuse(false);
+            http.end();                       // 不复用时 end() 会真的关掉连接
+            http.setReuse(true);
+        }
+        if (!r.keep && millis() - r.at > REQ_STALE_MS) {
+            if (r.kind >= 0) staleDropped = staleDropped + 1;
+        } else if (!netPause && WiFi.status() == WL_CONNECTED) {
+            postHub(r.path, r.body, nullptr, &http);
+        }
+        if (r.kind >= 0) pendingKinds &= ~(1u << r.kind);
         sending = false;
     }
 }
@@ -455,17 +498,17 @@ static void recordVoice() {
     free(buf);
 }
 
-// 往 hub 发按键。button = "dial" | "back" | "notify" | "chat"；dial != 0 时发滚轮转动（度）。
-static void sendButton(const char *button, int dial = 0) {
+// 往 hub 发按键。button = "dial" | "back" | "notify" | "chat" | "chat_hold" | "chat_release"；dial != 0 时发滚轮转动（度）。
+static void sendButton(int kind, const char *button, int dial = 0, bool keep = false) {
     String body = dial ? String("{\"dial\":") + dial + "}" : String("{\"button\":\"") + button + "\"}";
-    postAsync("/api/button", body);
+    postAsync("/api/button", body, kind, keep);
 }
 
 // ---------------------------------------------------------------- 输入
 // 读输入（pollInput）和发请求（processInput）分开：pollInput 每几毫秒调一次（取画面、等下一帧时也调），
 // 读到的操作先放进队列并马上响一声；processInput 每帧开头把队列里的请求交给后台任务发给 hub。
 // 这样按得再快也不会漏，按下去立刻有反馈，不用等这一帧画面下载完。
-enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK, EV_WHIP };
+enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_HISTORY, EV_HISTORY_END, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK, EV_WHIP };
 struct Ev {
     EvType type;
     int16_t x, y;
@@ -517,7 +560,11 @@ static void pollShake() {
 static void pollInput() {
     M5.update();
     if (M5.BtnA.wasPressed()) { click(); pushEv(EV_ENCOURAGE); }     // 左：一按下就算
-    if (M5.BtnB.wasPressed()) { click(); pushEv(EV_CHAT); }          // 中：一按下就算
+    // 中：点一下切换聊天内容（要分「点一下」和「按住」，所以松手时才触发）；按住 = 看历史聊天记录，松手回到工位
+    static bool historyHeld = false;
+    if (M5.BtnB.wasClicked()) { click(); pushEv(EV_CHAT); }
+    if (M5.BtnB.wasHold()) { click(); historyHeld = true; pushEv(EV_HISTORY); }
+    if (M5.BtnB.wasReleased() && historyHeld) { historyHeld = false; pushEv(EV_HISTORY_END); }
     if (M5.BtnC.wasClicked()) { click(); pushEv(EV_SKIN); }          // 右：点一下换肤（松手时才知道不是按住）
     if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }         // 按住右键 2 秒：设置
     pollShake();
@@ -541,18 +588,28 @@ static void pollFor(uint32_t ms) {
     } while (millis() - t0 < ms);
 }
 
+// 网络慢的时候：同一种操作上一下还没发到 hub，这一下就不发了，只提示一下（不然网络好了会一口气连换好几次肤）
+static bool stillSending(EvType t) {
+    if (!(pendingKinds & (1u << t))) return false;
+    showNotice("网络慢，上一下还在发…");
+    return true;
+}
+
 static void processInput() {
     while (evHead != evTail) {
         Ev e = evq[evHead];
         evHead = (evHead + 1) % 16;
+        if (stillSending(e.type)) continue;
         switch (e.type) {
-            case EV_ENCOURAGE: sendButton("back"); break;
-            case EV_CHAT: sendButton("chat"); break;                     // hub：显示 / 隐藏聊天记录
-            case EV_SKIN: sendButton("notify"); break;
+            case EV_ENCOURAGE: sendButton(e.type, "back"); break;
+            case EV_CHAT: sendButton(e.type, "chat"); break;             // hub：显示 / 隐藏聊天记录
+            case EV_HISTORY: sendButton(-1, "chat_hold"); break;         // hub：打开聊天记录页（和松开成对，不拦）
+            case EV_HISTORY_END: sendButton(-1, "chat_release", 0, true); break;   // hub：回到工位（再晚也要发）
+            case EV_SKIN: sendButton(e.type, "notify"); break;
             case EV_SETTINGS: wantSettings = true; return;
-            case EV_TAP: postAsync("/api/poke", String("{\"x\":") + e.x + ",\"y\":" + e.y + "}"); break;
-            case EV_FLICK: sendButton("", e.y > 0 ? 30 : -30); break;    // 往下滑看更早的消息，往上滑回到最新
-            case EV_WHIP: sendButton("dial"); break;                     // 摇一摇 = 抽鞭子（hub 自己也有冷却）
+            case EV_TAP: postAsync("/api/poke", String("{\"x\":") + e.x + ",\"y\":" + e.y + "}", e.type); break;
+            case EV_FLICK: sendButton(e.type, "", e.y > 0 ? 30 : -30); break;   // 往下滑看更早的消息，往上滑回到最新
+            case EV_WHIP: sendButton(e.type, "dial"); break;             // 摇一摇 = 抽鞭子（hub 自己也有冷却）
             case EV_HOLD: {                                              // 按住：录音（hub 按位置决定私聊谁 / 发群里）
                 if (!M5.Touch.getDetail().isPressed()) break;            // 已经松手了
                 String reply;
@@ -567,6 +624,10 @@ static void processInput() {
     if (hubErr) {
         hubErr = false;
         showNotice(hubErrCode == 401 ? String("Bad token") : "Hub error " + String(hubErrCode));
+    }
+    if (staleDropped) {
+        staleDropped = 0;
+        showNotice("网络太慢，刚才的操作没发出去");
     }
 
     if (vibeOffAt && millis() > vibeOffAt) {
@@ -586,6 +647,7 @@ static void openSettings(const char *reason) {
         WiFi.disconnect(true);
         delay(300);
         netFails = 0;
+        connReset = true;                     // hub 地址可能改了：发按键的连接重新建
         showNotice("已保存设置");
     }
     needKeyframe = true;                      // 设置界面用掉了 canvas：要一整帧重新开始
@@ -596,6 +658,7 @@ static void openSettings(const char *reason) {
 // ---------------------------------------------------------------- 性能统计
 static void reportStats() {
     if (millis() - stAt < 3000) return;
+    if (sending || uxQueueMessagesWaiting(reqQ)) return;   // 按键还没发完（网络慢）：这次不报，别排在按键前面
     float sec = (millis() - stAt) / 1000.0f;
     String body = String("{\"ver\":\"") + FW_VERSION + "\",\"fps\":" + String(stFrames / sec, 1) +
                   ",\"wait_ms\":" + (stFetchN ? stWaitMs / stFetchN : 0) +
@@ -627,6 +690,7 @@ void setup() {
     canvas.setPsram(true);
     canvas.createSprite(320, 240);
     canvas.setFont(&fonts::efontCN_14);        // 提示文字有中文
+    M5.BtnB.setHoldThresh(400);               // 中键：点一下切换聊天内容，按住 0.4 秒看历史聊天记录
     M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
 
     settingsLoad();
@@ -677,13 +741,7 @@ void loop() {
                 canvas.pushSprite(0, 0);
                 lcdStale = false;
             }
-            if (millis() < noticeUntil) {     // 叠一条小提示（口令错误之类），直接画在屏幕上
-                drawNotice();
-                noticeOnScreen = true;
-            } else if (noticeOnScreen) {      // 提示到时间了：用 canvas 把那块恢复
-                canvas.pushSprite(0, 0);
-                noticeOnScreen = false;
-            }
+            noticeDirty = true;               // 这一帧可能把提示盖掉了：重画
             stApplyMs += millis() - t0;
             stFrames++;
             stBytes += len;
@@ -696,5 +754,16 @@ void loop() {
         waitOrSettings(1000);
         if (wantSettings) openSettings("hub 连不上");
     }
-    pollFor(3);                               // 等下一帧的时候一直读输入
+    // 小提示（口令错误、网络慢之类）直接叠在屏幕上：按了键马上就能看到，不用等下一帧画面（网络差时要等很久）
+    if (!awaitKey && !lcdStale) {
+        if (millis() < noticeUntil) {
+            if (noticeDirty || !noticeOnScreen) drawNotice();
+            noticeOnScreen = true;
+        } else if (noticeOnScreen) {          // 提示到时间了：用 canvas 把那块恢复
+            canvas.pushSprite(0, 0);
+            noticeOnScreen = false;
+        }
+        noticeDirty = false;
+    }
+    pollFor(3);                              // 等下一帧的时候一直读输入
 }
