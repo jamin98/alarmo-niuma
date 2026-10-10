@@ -138,6 +138,14 @@ class Hub:
             of.show_chat = not of.show_chat
             of.say("显示聊天记录" if of.show_chat else "隐藏聊天记录", "ok", now)
             return
+        if button == "chat_hold":           # Core2 按住中键：看历史聊天记录（从最新一页开始），松手发 chat_release
+            of.view = "chat"
+            of.chat_scroll = 0
+            return
+        if button == "chat_release":
+            if of.view == "chat":
+                of.view = "office"
+            return
         if button == "back":                # 左上：一键鼓励 —— 老板挨个走到每个人面前发大饼，同时往群里发一句
             if of.tour_at(now):
                 of.say("老板正在发饼", "warn", now)
