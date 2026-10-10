@@ -220,15 +220,26 @@ struct Net {
     bool open;
 };
 
+static int scanErr = 0;                       // 最近一次扫描失败的返回值（0 = 没失败）
+
 static std::vector<Net> scan(M5Canvas &cv) {
     cv.fillScreen(BG);
     titleBar(cv, "选择 WiFi");
     cv.setTextDatum(textdatum_t::middle_center);
     cv.setTextColor(DIM, BG);
-    cv.drawString("正在扫描附近的 WiFi…", 160, 120);
+    cv.drawString("正在扫描附近的 WiFi…（几秒）", 160, 120);
     cv.pushSprite(0, 0);
-    if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
+    // 正在连接 / 反复重连（比如密码不对）时 ESP32 扫描会直接失败，先把连接停掉
+    WiFi.disconnect();
+    delay(150);
+    WiFi.mode(WIFI_STA);
     int n = WiFi.scanNetworks();
+    if (n < 0) {                                  // 失败就再试一次
+        WiFi.scanDelete();
+        delay(400);
+        n = WiFi.scanNetworks();
+    }
+    scanErr = n < 0 ? n : 0;
     std::vector<Net> nets;
     for (int i = 0; i < n; i++) {
         String s = WiFi.SSID(i);
@@ -266,7 +277,8 @@ static bool pickWifi(M5Canvas &cv, String &ssid, bool &open) {
         int pages = (total + per - 1) / per;
         page = std::max(0, std::min(page, pages - 1));
         cv.fillScreen(BG);
-        titleBar(cv, nets.empty() ? "选择 WiFi（没扫到）" : "选择 WiFi", "< 取消");
+        String title = scanErr ? "扫描失败（" + String(scanErr) + "），点重新扫描" : nets.empty() ? "选择 WiFi（没扫到）" : "选择 WiFi";
+        titleBar(cv, title.c_str(), "< 取消");
         for (int r = 0; r < per; r++) {
             int i = page * per + r;
             if (i >= total) break;

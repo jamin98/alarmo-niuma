@@ -280,6 +280,7 @@ class Hub:
     # ---- 主循环 ----
     async def render_loop(self):
         period = 1.0 / self.fps
+        next_t = time.time()
         while True:
             t = time.time()
             self.office.tick(t)
@@ -300,7 +301,11 @@ class Hub:
             self.frame_id += 1
             if self.link:
                 self.link.submit(np.asarray(img))
-            await asyncio.sleep(max(0.005, period - (time.time() - t)))
+            # 按下一帧的绝对时间等：Windows 上 asyncio.sleep 只有约 15.6ms 精度、常常提前醒，醒早了就再补
+            next_t = max(next_t + period, time.time() - period)
+            await asyncio.sleep(0.005)
+            while next_t - time.time() > 0.001:
+                await asyncio.sleep(next_t - time.time())
 
     async def demo_loop(self):
         of = self.office
@@ -499,8 +504,16 @@ class Hub:
 
     async def h_frame_jpg(self, request):
         """给 M5Stack Core2 这类自己联网取画面的小屏：320x240 JPEG，体积比 PNG 小、解码快。
-        ?q=1..95 画质，默认 80；响应头 X-Frame-Id 是帧序号。"""
+        ?q=1..95 画质，默认 80；响应头 X-Frame-Id 是帧序号。
+        ?after=<帧序号>：等到有比它新的一帧再返回（最多等 1 秒），客户端就不会重复下载同一帧。"""
         q = max(1, min(95, int(request.query.get("q", "80"))))
+        try:
+            after = int(request.query.get("after", "-1"))
+        except ValueError:
+            after = -1
+        end = time.time() + 1.0
+        while self.frame_id == after and time.time() < end:      # hub 重启后帧号变小，也算"新的"
+            await asyncio.sleep(0.005)
         fid, data = self._jpeg(q)
         return web.Response(body=data, content_type="image/jpeg",
                             headers={"Cache-Control": "no-store", "X-Frame-Id": str(fid)})

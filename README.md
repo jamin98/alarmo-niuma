@@ -84,7 +84,7 @@ bridge/bridge.py（装着 Grok Bot 桌面端的 Windows）        ← 读 Grok B
 ```
 
 - **桥接**（`bridge/`）：用 Windows 的 UI 自动化读 Grok Bot 窗口里的群聊、bot 状态、头像颜色，按 hub 的指令往群里发话、私聊某个 bot、触发 Grok 的听写；另外用你的 Cursor 登录 Cookie 调只读接口查额度和云端任务。
-- **hub**（`hub/`）：维护办公室状态，每秒 10 帧渲染 320×240 的画面，通过 USB 串口推给 Alarmo、通过 `/frame.jpg` 给 Core2、通过 MJPEG 给浏览器；同时提供网页模拟器。
+- **hub**（`hub/`）：维护办公室状态，每秒 20 帧渲染 320×240 的画面，通过 USB 串口推给 Alarmo、通过 `/frame.jpg` 给 Core2、通过 MJPEG 给浏览器；同时提供网页模拟器。
 - **屏幕**：Alarmo 固件（`firmware/`）、Core2 固件（`m5core2/`）或任意浏览器。
 
 ---
@@ -445,7 +445,7 @@ Grok Bot 的额度由 Cursor 后端提供，桥接每隔几分钟调两个**只�
 | | `poke_text` | 点名时私聊那个 bot 的话，默认 `"干活，我在盯着你"` |
 | | `cooldown` | 两次发送的最小间隔（秒），默认 3 |
 | `[device]` | `port` | `"auto"`（推荐）/ `"COM5"` / `"/dev/ttyACM0"` / 留空 = 不连 Alarmo |
-| | `fps` / `brightness` | 帧率（默认 10）、背光（0~1） |
+| | `fps` / `brightness` | 每秒画几帧（默认 20，越高 Core2 / 网页上越流畅）、背光（0~1） |
 | `[render]` | `theme` | 默认主题：`blueprint` `neon` `barn` `space` `meeting` `tower` `wheel` `derby`；写了已删除的旧主题（`pixel` / `classroom` / `classic`）会自动改用 `blueprint` |
 | | `font` | 中文字体文件，留空自动找（微软雅黑 / 文泉驿 / Noto CJK） |
 
@@ -490,7 +490,7 @@ python bridge.py --voice-test [完整名] [--wav 文件] # 测按住说话：让
 | 接口 | 用途 |
 |---|---|
 | `GET /` | 网页模拟器 |
-| `GET /stream.mjpg` · `/frame.jpg?q=80` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（Core2 用，响应头 `X-Frame-Id`）/ 单帧 PNG |
+| `GET /stream.mjpg` · `/frame.jpg?q=80&after=帧号` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（Core2 用；响应头 `X-Frame-Id` 是帧号，带 `after` 时等到有新帧才返回）/ 单帧 PNG |
 | `GET /api/state` | 当前状态（bot、公告、录音、额度、主题等） |
 | `POST /api/button` | `{"button": "dial" \| "back" \| "notify" \| "chat"}`（`chat` = 显示 / 隐藏聊天内容）或 `{"dial": 30}` |
 | `POST /api/poke` | 点名：`{"x": .., "y": ..}`（屏幕坐标）或 `{"name": "短名"}` |

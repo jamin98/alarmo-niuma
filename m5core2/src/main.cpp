@@ -1,7 +1,7 @@
 // 牛马办公室 - M5Stack Core2 屏幕端
 //
 // Core2 的屏幕正好是 320x240，和 hub 渲染的画面一样大。这里不做任何绘制，只做三件事：
-//   1. 连 WiFi，从 hub 轮询 /frame.jpg 并显示；
+//   1. 连 WiFi，从 hub 取 /frame.jpg 并显示（下载在 core 0 的网络任务里，解码和推屏在 core 1，两边同时干）；
 //   2. 把按键、滑动、摇一摇变成 hub 的 /api/button 请求；
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
@@ -17,6 +17,8 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 
+#include <utility>
+
 #if __has_include("niuma_config.h")                // 可选的本地配置（不进 git）；没有就用示例里的默认值
 #include "niuma_config.h"                           // 只当出厂默认值；真正用的设置在屏幕上改，存在 NVS 里
 #else
@@ -27,10 +29,17 @@
 static constexpr size_t JPG_MAX = 120 * 1024;
 
 static M5Canvas canvas(&M5.Display);          // 先画到内存里再整屏推出去，避免撕裂
-static uint8_t *jpgBuf = nullptr;
-static WiFiClient frameClient;
-static HTTPClient frameHttp;                  // 一直复用同一个连接，省掉每帧握手
-static int failCount = 0;
+
+// 三个 JPEG 缓冲区：网络任务往 back 里下载，下完和 mid 交换；主循环把 mid 换到 front 再解码。
+// 下载和解码同时进行，谁也不用等谁；只显示最新的一帧。
+static uint8_t *jpg[3];
+static int jpgLen[3];
+static int backBuf = 0, midBuf = 1, frontBuf = 2;
+static bool midFresh = false;
+static portMUX_TYPE frameMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool netPause = true;         // 连 WiFi、进设置时停下网络任务
+static volatile uint32_t netFails = 0;
+static uint32_t lastFrameAt = 0;
 static uint32_t noticeUntil = 0;
 static String notice;
 static uint32_t vibeOffAt = 0;
@@ -104,40 +113,78 @@ static bool connectWifi(uint32_t timeoutMs = 15000) {
     return WiFi.status() == WL_CONNECTED;
 }
 
-static bool fetchFrame() {
-    frameHttp.setReuse(true);
-    frameHttp.setConnectTimeout(1500);
-    frameHttp.setTimeout(2500);
-    String url = S.hub + "/frame.jpg?q=" + String(JPEG_QUALITY);
-    if (!frameHttp.begin(frameClient, url)) return false;
-    int code = frameHttp.GET();
-    if (code != 200) {
-        frameHttp.end();
+// ---------------------------------------------------------------- 取画面（core 0 上的网络任务）
+// /frame.jpg?after=<上一帧的帧号>：hub 有了新的一帧才返回（最多等 1 秒），不会重复下载同一帧。
+static bool fetchInto(HTTPClient &http, WiFiClient &client, uint8_t *buf, int &len, uint32_t &id) {
+    static const char *hdrs[] = {"X-Frame-Id"};
+    http.setReuse(true);                      // 一直复用同一个连接，省掉每帧握手
+    http.setConnectTimeout(1500);
+    http.setTimeout(3000);
+    String url = S.hub + "/frame.jpg?q=" + String(JPEG_QUALITY) + "&after=" + String(id);
+    if (!http.begin(client, url)) return false;
+    http.collectHeaders(hdrs, 1);
+    int code = http.GET();
+    int size = http.getSize();
+    if (code != 200 || size <= 0 || (size_t)size > JPG_MAX) {
+        http.end();
         return false;
     }
-    int len = frameHttp.getSize();
-    if (len <= 0 || (size_t)len > JPG_MAX) {
-        frameHttp.end();
-        return false;
-    }
-    WiFiClient *s = frameHttp.getStreamPtr();
+    uint32_t newId = http.header("X-Frame-Id").toInt();
+    WiFiClient *s = http.getStreamPtr();
     int got = 0;
     uint32_t t0 = millis();
-    while (got < len && millis() - t0 < 2500) {
+    while (got < size && millis() - t0 < 3000) {
         int n = s->available();
-        if (n > 0) {
-            got += s->readBytes(jpgBuf + got, min(n, len - got));
-        } else if (!s->connected()) {
-            break;
-        } else {
-            pollInput();
-            delay(1);
-        }
+        if (n > 0) got += s->readBytes(buf + got, min(n, size - got));
+        else if (!s->connected()) break;
+        else delay(1);
     }
-    frameHttp.end();
-    if (got != len) return false;
-    canvas.drawJpg(jpgBuf, len, 0, 0);
+    http.end();
+    if (got != size) return false;
+    len = size;
+    id = newId;
     return true;
+}
+
+static void netTask(void *) {
+    WiFiClient client;
+    HTTPClient http;
+    uint32_t id = 0;
+    for (;;) {
+        if (netPause || WiFi.status() != WL_CONNECTED) {
+            id = 0;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        uint32_t t0 = millis();
+        int len = 0;
+        if (fetchInto(http, client, jpg[backBuf], len, id)) {
+            netFails = 0;
+            portENTER_CRITICAL(&frameMux);
+            jpgLen[backBuf] = len;
+            std::swap(backBuf, midBuf);
+            midFresh = true;
+            portEXIT_CRITICAL(&frameMux);
+        } else {
+            netFails = netFails + 1;
+            vTaskDelay(pdMS_TO_TICKS(netFails > 3 ? 500 : 100));
+        }
+        uint32_t used = millis() - t0;
+        if (used < FRAME_MS) vTaskDelay(pdMS_TO_TICKS(FRAME_MS - used));
+    }
+}
+
+// 主循环拿最新下好的一帧（没有新的返回 false）
+static bool takeFrame() {
+    bool ok = false;
+    portENTER_CRITICAL(&frameMux);
+    if (midFresh) {
+        std::swap(frontBuf, midBuf);
+        midFresh = false;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&frameMux);
+    return ok;
 }
 
 // 往 hub 的某个接口 POST 一段 JSON。reply 不为空时带回响应内容。
@@ -299,13 +346,15 @@ static void processInput() {
 // ---------------------------------------------------------------- 设置
 static void openSettings(const char *reason) {
     wantSettings = false;
+    netPause = true;                          // 扫描 WiFi、改地址时别让网络任务在旁边连 hub
+    delay(100);
     if (settingsUI(canvas, reason)) {         // 保存了：用新设置重连
-        frameHttp.end();
         WiFi.disconnect(true);
         delay(300);
-        failCount = 0;
-        showNotice("Settings saved");
+        netFails = 0;
+        showNotice("已保存设置");
     }
+    lastFrameAt = millis();
 }
 
 // ---------------------------------------------------------------- 主流程
@@ -316,14 +365,15 @@ void setup() {
     M5.Speaker.setVolume(140);
     Serial.begin(115200);
 
-    jpgBuf = (uint8_t *)ps_malloc(JPG_MAX);   // Core2 有 8MB PSRAM
-    if (!jpgBuf) jpgBuf = (uint8_t *)malloc(JPG_MAX);
+    for (auto &b : jpg) b = (uint8_t *)ps_malloc(JPG_MAX);     // Core2 有 8MB PSRAM
     canvas.setColorDepth(16);
     canvas.setPsram(true);
     canvas.createSprite(320, 240);
+    canvas.setFont(&fonts::efontCN_14);        // 提示文字有中文
     M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
 
     settingsLoad();
+    xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);   // 下载画面放在 core 0
     drawStatus("牛马办公室", "启动中…");
     if (S.ssid.isEmpty()) openSettings("先设置 WiFi");
     if (!connectWifi()) {
@@ -333,7 +383,6 @@ void setup() {
 }
 
 void loop() {
-    uint32_t t0 = millis();
     if (wantSettings) {
         openSettings(WiFi.status() == WL_CONNECTED ? nullptr : "WiFi 连不上");
         return;
@@ -343,15 +392,18 @@ void loop() {
     if (wantSettings) return;
 
     if (WiFi.status() != WL_CONNECTED) {
+        netPause = true;
         if (!connectWifi(8000) && !wantSettings) {
             drawStatus("WiFi 连不上", S.ssid + "  重试中…", "点屏幕 = 修改设置");
             waitOrSettings(2000);
         }
+        lastFrameAt = millis();
         return;
     }
+    netPause = false;
 
-    if (fetchFrame()) {
-        failCount = 0;
+    if (takeFrame()) {                        // 有新的一帧：解码、叠提示、推到屏幕
+        canvas.drawJpg(jpg[frontBuf], jpgLen[frontBuf], 0, 0);
         if (millis() < noticeUntil) {         // 叠一条小提示（口令错误之类）
             canvas.fillRoundRect(60, 205, 200, 24, 6, TFT_BLACK);
             canvas.setTextDatum(textdatum_t::middle_center);
@@ -359,12 +411,11 @@ void loop() {
             canvas.drawString(notice, 160, 217);
         }
         canvas.pushSprite(0, 0);
-    } else if (++failCount >= 3) {
+        lastFrameAt = millis();
+    } else if (netFails >= 3 && millis() - lastFrameAt > 2000) {
         drawStatus("hub 连不上", S.hub, "点屏幕 = 修改设置");
         waitOrSettings(1000);
         if (wantSettings) openSettings("hub 连不上");
     }
-
-    uint32_t used = millis() - t0;
-    pollFor(used < FRAME_MS ? FRAME_MS - used : 1);       // 等下一帧的时候也一直读输入
+    pollFor(3);                               // 等下一帧的时候一直读输入
 }

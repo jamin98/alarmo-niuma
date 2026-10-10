@@ -43,7 +43,7 @@ cooldown = 3.0                # 两次发送的最小间隔（秒）
 # Alarmo 的串口。"auto" 按 USB 的 VID:PID 自动找，Debian / 树莓派 / Windows 都不用改；
 # 也可以写死: "COM5"（Windows）、"/dev/ttyACM0"（树莓派/Linux）、带通配符的路径；留空则不连设备，只用网页模拟器
 port = "auto"
-fps = 10
+fps = 20                      # 每秒画几帧：越高 Core2 / 网页上的动画越流畅；Alarmo 的 USB 跟不上时只发最新的一帧
 brightness = 0.8
 
 [render]

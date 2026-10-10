@@ -10,6 +10,6 @@
 #define HUB_TOKEN   ""
 
 #define JPEG_QUALITY   80     // 越低越小越快，画面越糊
-#define FRAME_MS       100    // 两次取图的最小间隔，100 = 最多 10 帧/秒
+#define FRAME_MS       30     // 两次取图的最小间隔（毫秒）；hub 有新帧才会返回，所以实际帧率跟着 hub 的 fps 走
 #define BRIGHTNESS     160    // 背光 0~255
 #define SHAKE_G        2.3f   // 摇一摇抽鞭子的灵敏度（加速度，单位 g），不想要就改成 99
