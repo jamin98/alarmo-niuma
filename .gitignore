@@ -3,6 +3,7 @@ hub/config.toml
 bridge/config.toml
 bridge/secrets.toml
 m5core2/include/config.h
+m5core2/include/niuma_config.h
 hub/certs/
 
 # 编译产物和下载的上游代码

@@ -1,4 +1,5 @@
-// 复制成 config.h 再改（config.h 在 .gitignore 里，不会被提交）
+// 出厂默认值。WiFi、hub 地址、口令平时在 Core2 屏幕上设置（按住右键 2 秒），存在 Core2 里，不用改这里；
+// 只有 Core2 里还没存过设置时才用下面的值。想改默认值或调参：复制成 niuma_config.h 再改（niuma_config.h 不进 git）
 #pragma once
 
 #define WIFI_SSID   "你的WiFi名"

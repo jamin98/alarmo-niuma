@@ -1,12 +1,12 @@
 # M5Stack Core2 屏幕端
 
-Core2（含 v1.1 / v1.3，BMI270 或 MPU6886 都行）的屏幕正好是 320×240，和 hub 渲染的画面一样大。固件只做三件事：连 WiFi 从 hub 取 `/frame.jpg` 显示；把按键、滑动、摇一摇变成 `/api/button` 请求；用振动和扬声器给抽鞭子加反馈。**不需要 USB 串口协议，也不需要 Alarmo 的 AES key。**
+Core2（含 v1.1 / v1.3，BMI270 或 MPU6886 都行）的屏幕正好是 320×240，和 hub 渲染的画面一样大。固件只做几件事：连 WiFi 从 hub 取 `/frame.jpg` 显示；把按键、触摸、滑动、摇一摇、录音变成 hub 的请求；用振动和扬声器给抽鞭子加反馈。**不需要 USB 串口协议，也不需要 Alarmo 的 AES key。**
 
 | 操作 | 作用 |
 |---|---|
 | 屏幕下方左键 | 一键鼓励（老板发大饼 + 群里发「大家辛苦了」） |
-| 屏幕下方中键 | 抽鞭子（大按钮）；也用来从聊天记录回到工位 |
-| 屏幕下方右键 | 换肤 |
+| 屏幕下方中键 | 抽鞭子（大按钮）；在聊天记录 / 额度页里是回到工位 |
+| 屏幕下方右键 | 点一下 = 换肤；**按住 2 秒 = 设置** |
 | 屏幕上上下滑动 | 转滚轮：进聊天记录、翻页 |
 | 点一下屏幕上的某只牛马 | 点名：老板跑过去盯着它，并私聊它一句（`/api/poke`） |
 | 按住某只牛马 / 按住「我」 | 说话私聊它 / 发到群里：用 Core2 自带的麦克风录（屏幕右上角显示 REC），松手把录音传给 hub，由 Grok Bot 听写成文字发出去；最长 60 秒。跑 Grok Bot 的电脑要装虚拟麦克风，见主 README |
@@ -17,26 +17,39 @@ Core2（含 v1.1 / v1.3，BMI270 或 MPU6886 都行）的屏幕正好是 320×24
 ```bash
 pip install platformio           # 或用 VS Code 的 PlatformIO 插件
 cd m5core2
-cp include/config.example.h include/config.h     # Windows: copy include\config.example.h include\config.h
-# 编辑 include/config.h：WIFI_SSID、WIFI_PASS、HUB_URL、HUB_TOKEN
 pio run -t upload                # Core2 用 USB-C 接电脑
 pio device monitor               # 看日志（可选）
 ```
 
-- 第一次编译会下载 ESP32 工具链（几百 MB），需要一点时间。
-- `include/config.h` 里有 WiFi 密码和 hub 口令，已经在 `.gitignore` 里，不要提交。
-- `HUB_URL` 要写 Core2 能访问到的 hub 地址（和 Core2 在同一个局域网，hub 所在电脑的防火墙要放行 8765，见主 README）。
-- `HUB_TOKEN` 就是 `hub/config.toml` 里的 `[server] token`；没设口令就留空。
+- 第一次编译会下载 ESP32 工具链（几百 MB），需要一点时间。Windows 认不出串口时装 WCH 的 CH9102 驱动。
+- **WiFi、hub 地址、口令都在屏幕上设置**，不用改代码、不用重新编译，见下一节。
+
+## 在屏幕上设置
+
+第一次开机（还没设过 WiFi）会直接进入设置界面；以后随时**按住右键 2 秒**进入；连不上 WiFi 或 hub 时，点一下屏幕也能进入。
+
+| 界面 | 怎么用 |
+|---|---|
+| 设置首页 | 四行：WiFi、WiFi 密码、hub 地址、hub 口令，点哪行改哪行；底部「取消」「保存并连接」（实体键：左 = 取消，右 = 保存） |
+| 选 WiFi | 自动扫描附近的网络，按信号强弱排列，带锁的是有密码的，`*` 是当前用的；点一下选中，有密码会接着弹出键盘。第一行「手动输入 WiFi 名」用于隐藏网络。底部（或实体键左 / 中 / 右）：上一页 / 重新扫描 / 下一页 |
+| 屏幕键盘 | 小写、大写、符号三套键位：「大写」切换大小写（只管一个字母）、「#+=」切到符号、「删除」退格、「OK」确定；左上角「< 取消」放弃这次修改。实体键：左 = 取消、中 = 删除、右 = 确定 |
+
+- hub 地址填 Core2 能访问到的地址，如 `http://192.168.1.100:8765`（hub 启动时会打印本机 IP；hub 所在电脑的防火墙要放行 8765）。忘了写 `http://` 会自动补上。
+- hub 口令就是 `hub/config.toml` 里的 `[server] token`；hub 没设口令就留空。
+- Core2 只支持 **2.4 GHz** WiFi。
+- 设置存在 Core2 的闪存（NVS）里，断电、重新烧录同一个固件都还在；保存后马上用新设置重连。
+
+**出厂默认值（可选）**：想让新烧的 Core2 一开机就用某组设置，可以 `cp include/config.example.h include/niuma_config.h` 再改里面的 `WIFI_SSID` 等，重新编译烧录。只有在 Core2 里还没存过设置时才会用这些值；`niuma_config.h` 在 `.gitignore` 里，没有它也能编译。
 
 ## 调参
 
-都在 `include/config.h`：`JPEG_QUALITY`（越低越快越糊）、`FRAME_MS`（取图间隔，100 = 最多 10 帧/秒）、`BRIGHTNESS`（背光）、`SHAKE_G`（摇一摇灵敏度，不想要就写 99）。
+在 `include/niuma_config.h`（没有就复制 `config.example.h`）：`JPEG_QUALITY`（越低越快越糊）、`FRAME_MS`（取图间隔，100 = 最多 10 帧/秒）、`BRIGHTNESS`（背光）、`SHAKE_G`（摇一摇灵敏度，不想要就写 99）。这几项改了要重新编译。
 
 ## 排错
 
 | 屏幕显示 | 原因 |
 |---|---|
-| `Connecting WiFi...` 一直转 | WiFi 名或密码不对；Core2 只支持 2.4 GHz |
-| `Hub offline` | hub 没运行 / `HUB_URL` 不对 / 防火墙拦了 8765 / 不在同一网段 |
-| 画面正常，但按键后提示 `Bad token` | `HUB_TOKEN` 和 hub 的不一致 |
+| 「连接 WiFi…」一直转 | WiFi 名或密码不对，或者是 5 GHz 网络；点屏幕进设置重新选 |
+| 「hub 连不上」 | hub 没运行 / hub 地址不对 / 防火墙拦了 8765 / 不在同一网段；点屏幕进设置改地址 |
+| 画面正常，但按键后提示 `Bad token` | hub 口令和 `hub/config.toml` 的 `token` 不一致；按住右键 2 秒进设置改 |
 | 帧率低 | 降低 `JPEG_QUALITY`，或换掉 `neon` 主题（辉光让画面最复杂） |

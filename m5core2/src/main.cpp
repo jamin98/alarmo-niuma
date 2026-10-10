@@ -12,11 +12,17 @@
 //   按住某只牛马 / 按住「我」 说话私聊它 / 发到群里：用 Core2 自带的麦克风录，松手把录音传给 hub，
 //                            由 Grok Bot 听写成文字发出去（跑 Grok Bot 的电脑上要装虚拟麦克风，见 README）
 //   摇一摇设备            抽鞭子
+//   按住右键 2 秒          设置：选 WiFi、输密码、改 hub 地址和口令（存在 Core2 里，不用重新编译）
 #include <M5Unified.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 
-#include "config.h"
+#if __has_include("niuma_config.h")                // 可选的本地配置（不进 git）；没有就用示例里的默认值
+#include "niuma_config.h"                           // 只当出厂默认值；真正用的设置在屏幕上改，存在 NVS 里
+#else
+#include "config.example.h"
+#endif
+#include "settings.h"
 
 static constexpr size_t JPG_MAX = 120 * 1024;
 
@@ -29,6 +35,7 @@ static uint32_t noticeUntil = 0;
 static String notice;
 static uint32_t vibeOffAt = 0;
 static uint32_t lastShake = 0;
+static bool wantSettings = false;             // 要进设置界面（按住右键，或在连不上的画面上点了屏幕）
 
 // ---------------------------------------------------------------- 小工具
 static void showNotice(const String &s, uint32_t ms = 2000) {
@@ -42,12 +49,28 @@ static void centerText(const String &s, int y, uint16_t color = TFT_WHITE) {
     M5.Display.drawString(s, M5.Display.width() / 2, y);
 }
 
-static void drawStatus(const String &line1, const String &line2 = "") {
+static void drawStatus(const String &line1, const String &line2 = "", const String &hint = "") {
     M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setFont(&fonts::efontCN_14);
     M5.Display.setTextSize(2);
-    centerText(line1, 100);
+    centerText(line1, 96);
     M5.Display.setTextSize(1);
-    centerText(line2, 135, TFT_LIGHTGREY);
+    centerText(line2, 136, TFT_LIGHTGREY);
+    centerText(hint.length() ? hint : String("按住右键 2 秒 = 设置"), 212, 0x7BEF);
+}
+
+// 等一会儿；期间点了屏幕或按住右键就记下"要进设置"，提前返回
+static void waitOrSettings(uint32_t ms) {
+    uint32_t t0 = millis();
+    while (millis() - t0 < ms) {
+        M5.update();
+        auto t = M5.Touch.getDetail();
+        if ((t.wasClicked() && t.y < M5.Display.height()) || M5.BtnC.wasHold()) {
+            wantSettings = true;
+            return;
+        }
+        delay(20);
+    }
 }
 
 static void click() {
@@ -64,14 +87,18 @@ static void whipFeedback() {                  // 啪！：一声脆响 + 振动
 // ---------------------------------------------------------------- 网络
 static bool connectWifi(uint32_t timeoutMs = 15000) {
     if (WiFi.status() == WL_CONNECTED) return true;
+    if (S.ssid.isEmpty()) {
+        wantSettings = true;
+        return false;
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);                     // 关省电，帧率稳很多
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(S.ssid.c_str(), S.pass.c_str());
     uint32_t t0 = millis();
     int dots = 0;
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
-        drawStatus("Connecting WiFi" + String("....").substring(0, dots++ % 4), WIFI_SSID);
-        delay(400);
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs && !wantSettings) {
+        drawStatus("连接 WiFi" + String("....").substring(0, dots++ % 4), S.ssid, "点屏幕 = 修改设置");
+        waitOrSettings(400);
     }
     return WiFi.status() == WL_CONNECTED;
 }
@@ -80,7 +107,7 @@ static bool fetchFrame() {
     frameHttp.setReuse(true);
     frameHttp.setConnectTimeout(1500);
     frameHttp.setTimeout(2500);
-    String url = String(HUB_URL) + "/frame.jpg?q=" + String(JPEG_QUALITY);
+    String url = S.hub + "/frame.jpg?q=" + String(JPEG_QUALITY);
     if (!frameHttp.begin(frameClient, url)) return false;
     int code = frameHttp.GET();
     if (code != 200) {
@@ -116,9 +143,9 @@ static bool postHub(const char *path, const String &body, String *reply = nullpt
     HTTPClient http;
     http.setConnectTimeout(1500);
     http.setTimeout(2500);
-    if (!http.begin(String(HUB_URL) + path)) return false;
+    if (!http.begin(S.hub + path)) return false;
     http.addHeader("Content-Type", "application/json");
-    if (strlen(HUB_TOKEN)) http.addHeader("X-Token", HUB_TOKEN);
+    if (S.token.length()) http.addHeader("X-Token", S.token);
     int code = http.POST(body);
     if (reply && code == 200) *reply = http.getString();
     http.end();
@@ -167,9 +194,9 @@ static void recordVoice() {
     HTTPClient http;
     http.setConnectTimeout(1500);
     http.setTimeout(15000);
-    if (http.begin(String(HUB_URL) + "/api/voice/clip")) {
+    if (http.begin(S.hub + "/api/voice/clip")) {
         http.addHeader("Content-Type", "audio/wav");
-        if (strlen(HUB_TOKEN)) http.addHeader("X-Token", HUB_TOKEN);
+        if (S.token.length()) http.addHeader("X-Token", S.token);
         int code = http.POST(buf, 44 + n * 2);
         http.end();
         showNotice(code == 200 ? "Sent to Grok" : "Upload error " + String(code));
@@ -198,6 +225,11 @@ static void handleInput() {
     if (M5.BtnC.wasClicked()) {               // 右：换肤
         click();
         sendButton("notify");
+    }
+    if (M5.BtnC.wasHold()) {                  // 按住右键：设置
+        click();
+        wantSettings = true;
+        return;
     }
 
     // 屏幕上滑动 = 转滚轮。往下滑看更早的消息，往上滑回到最新
@@ -238,6 +270,18 @@ static void handleInput() {
     }
 }
 
+// ---------------------------------------------------------------- 设置
+static void openSettings(const char *reason) {
+    wantSettings = false;
+    if (settingsUI(canvas, reason)) {         // 保存了：用新设置重连
+        frameHttp.end();
+        WiFi.disconnect(true);
+        delay(300);
+        failCount = 0;
+        showNotice("Settings saved");
+    }
+}
+
 // ---------------------------------------------------------------- 主流程
 void setup() {
     auto cfg = M5.config();
@@ -251,19 +295,30 @@ void setup() {
     canvas.setColorDepth(16);
     canvas.setPsram(true);
     canvas.createSprite(320, 240);
+    M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
 
-    drawStatus("Niuma Office", "starting...");
-    if (!connectWifi()) drawStatus("WiFi failed", String("check ") + WIFI_SSID);
+    settingsLoad();
+    drawStatus("牛马办公室", "启动中…");
+    if (S.ssid.isEmpty()) openSettings("先设置 WiFi");
+    if (!connectWifi()) {
+        drawStatus("WiFi 连不上", S.ssid, "点屏幕 = 修改设置");
+        waitOrSettings(3000);
+    }
 }
 
 void loop() {
     uint32_t t0 = millis();
+    if (wantSettings) {
+        openSettings(WiFi.status() == WL_CONNECTED ? nullptr : "WiFi 连不上");
+        return;
+    }
     handleInput();
+    if (wantSettings) return;
 
     if (WiFi.status() != WL_CONNECTED) {
-        if (!connectWifi(8000)) {
-            drawStatus("WiFi lost", "retrying...");
-            delay(1000);
+        if (!connectWifi(8000) && !wantSettings) {
+            drawStatus("WiFi 连不上", S.ssid + "  重试中…", "点屏幕 = 修改设置");
+            waitOrSettings(2000);
         }
         return;
     }
@@ -278,8 +333,9 @@ void loop() {
         }
         canvas.pushSprite(0, 0);
     } else if (++failCount >= 3) {
-        drawStatus("Hub offline", String(HUB_URL));
-        delay(1000);
+        drawStatus("hub 连不上", S.hub, "点屏幕 = 修改设置");
+        waitOrSettings(1000);
+        if (wantSettings) openSettings("hub 连不上");
     }
 
     uint32_t used = millis() - t0;

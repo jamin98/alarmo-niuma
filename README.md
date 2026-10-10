@@ -275,14 +275,7 @@ AES_IV  = bytearray.fromhex("这里是 32 位十六进制")
 
 Alarmo 装不了第三方固件时，用这一步代替第 4 步。Core2 的屏幕正好 320×240，带 WiFi、触摸、麦克风、振动、扬声器和 IMU，不依赖 Alarmo 的任何东西。详细说明见 [m5core2/README.md](m5core2/README.md)。
 
-1. 复制配置并填写：
-
-   ```bash
-   cp m5core2/include/config.example.h m5core2/include/config.h
-   ```
-
-   改 `WIFI_SSID`、`WIFI_PASS`（只支持 **2.4 GHz**）、`HUB_URL`（hub 的内网地址，如 `http://192.168.x.x:8765`）、`HUB_TOKEN`（`hub/config.toml` 的 `[server] token`，没设就留空）。这个文件在 `.gitignore` 里。
-2. 用 USB-C 接上 Core2，烧录（第一次会下载 ESP32 工具链，要等一会儿；Windows 认不出串口时装 WCH 的 CH9102 驱动）：
+1. 用 USB-C 接上 Core2，烧录（第一次会下载 ESP32 工具链，要等一会儿；Windows 认不出串口时装 WCH 的 CH9102 驱动）：
 
    ```bash
    pip install platformio
@@ -290,7 +283,10 @@ Alarmo 装不了第三方固件时，用这一步代替第 4 步。Core2 的屏�
    pio run -t upload
    ```
 
-3. 开机后先显示连接 WiFi 的进度，连上 hub 就是工位画面。操作见 [怎么操作](#怎么操作)。
+2. **在屏幕上设置**：第一次开机会直接进入设置界面，扫描附近的 WiFi 点选、用屏幕键盘输密码，再填 hub 地址（如 `http://192.168.x.x:8765`）和口令（`hub/config.toml` 的 `[server] token`，没设就留空），点「保存并连接」。设置存在 Core2 里，以后要改就**按住右键 2 秒**，不用重新编译。只支持 **2.4 GHz** WiFi。
+3. 连上 hub 就是工位画面。操作见 [怎么操作](#怎么操作)。
+
+想让新烧的 Core2 自带一组默认设置，可以把 `m5core2/include/config.example.h` 复制成同目录下的 `niuma_config.h` 再改（不进 git），见 [m5core2/README.md](m5core2/README.md)。
 
 ### 5. 联调与开机自启
 
@@ -366,6 +362,7 @@ python bridge\bridge.py --voice-test 某个bot的完整名
 | 操作 | 作用 |
 |---|---|
 | 屏幕下方左 / 中 / 右触摸键 | 发大饼 / 抽鞭子（在聊天记录里是回到工位）/ 换肤 |
+| 按住右键 2 秒 | 设置：选 WiFi、输密码、改 hub 地址和口令（存在 Core2 里，不用重新编译） |
 | 点一下屏幕上的某只牛马 | 点名 |
 | 按住某只牛马 / 按住「我」 | 用 Core2 自带的麦克风录音（右上角显示 REC），松手发送，最长 60 秒 |
 | 屏幕上下滑动 | 转滚轮：聊天记录 / 额度页 |
@@ -474,7 +471,7 @@ Grok Bot 的额度由 Cursor 后端提供，桥接每隔几分钟调两个**只�
 
 **`bridge/secrets.toml`**：`cursor_session`，cursor.com 的登录 Cookie（额度和云端任务要用）。
 
-**`m5core2/include/config.h`**：`WIFI_SSID`、`WIFI_PASS`、`HUB_URL`、`HUB_TOKEN`，以及 `JPEG_QUALITY`、`FRAME_MS`、`BRIGHTNESS`、`SHAKE_G`（见 [m5core2/README.md](m5core2/README.md)）。
+**Core2**：WiFi、hub 地址、口令在 Core2 屏幕上设置（按住右键 2 秒），存在 Core2 里；`m5core2/include/niuma_config.h`（可选，不进 git）只放出厂默认值和 `JPEG_QUALITY`、`FRAME_MS`、`BRIGHTNESS`、`SHAKE_G`（见 [m5core2/README.md](m5core2/README.md)）。
 
 ## 命令行与接口
 
@@ -537,7 +534,7 @@ curl -s -X POST 'http://<hub>:8765/api/events?from=bot' -H 'Content-Type: applic
 | 工位上 bot 不对 | `me` 没填对，你被当成了 bot；或当前打开的不是要监控的群 |
 | 工位上少了几个 bot | 工位最多 6 个，多出来的按「群成员 > 正在干活 > 侧边栏顺序」取舍 |
 | 牛马全是灰色 | 颜色读取失败（窗口最小化）或头像本来就是灰色；在 `[colors]` 手动指定 |
-| Core2 显示 `Hub offline` / 按键提示 `Bad token` | `HUB_URL` 不对或防火墙拦了 8765 / `HUB_TOKEN` 和 hub 的不一致 |
+| Core2 显示「hub 连不上」/ 按键提示 `Bad token` | hub 地址不对或防火墙拦了 8765 / 口令和 hub 的不一致；点屏幕或按住右键 2 秒进设置改 |
 | 装固件后屏幕黄色方块一直不消失 | hub 没连上：`python hub.py --list-ports` 看有没有 `*`；Linux 查 `dialout` 组 |
 | 屏幕是**红色**方块 | 固件的 USB 初始化失败。Alarmo 的 USB 接线没有公开资料，代码按 ST 同系列芯片的例程假设用片内全速 PHY（PA11 / PA12），需要真机上排查 |
 | 拷完 `MarkFile` 后闹钟重启，但**没出现小猫**（现成的上游 `a.bin`） | **先看顶部的兼容性说明：v3.0.0 及以后、以及校验串为 `c74976c35f` 的新出厂 v2.0.0 机器，USB 载入已被修补，下面的排查都没用。** 理论上可以的机器再排查：① `a.bin` 和 `MarkFile` 来自上游 Releases 的同一个版本；② `a.bin` 拷完再拷 `MarkFile`，或用 `python firmware/flash.py E:\`；③ 换能传数据的线、直连主板的 USB 口；④ 重新进 U 盘模式前先拔电，三个键按住直到滚轮亮红灯 |
