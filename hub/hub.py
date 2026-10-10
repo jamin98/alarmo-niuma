@@ -14,6 +14,7 @@ import random
 import socket
 import struct
 import time
+import zlib
 from collections import OrderedDict
 try:
     import tomllib
@@ -151,6 +152,40 @@ class Hub:
             return
         of.whip(now)
         self.send_text(self.buttons.get("dial_text", ""), now)
+
+    def question_tap(self, hit, now=None):
+        """点了提问卡片或公告栏上的「待确认」：打开卡片 / 关掉 / 选一个选项（让桥接在 Grok Bot 里替你点）。"""
+        now = now or time.time()
+        of = self.office
+        if hit[0] == "open":
+            of.question_open = hit[1]
+            return {"ok": True, "question": "open"}
+        if hit[0] == "close":
+            of.question_open = ""
+            return {"ok": True, "question": "close"}
+        q, k = of.question(hit[1]), hit[2]
+        if q is None or q.state != "pending" or not 0 <= k < len(q.options):
+            return {"ok": False, "error": "这个问题已经处理了"}
+        if self.demo:
+            of.answer_question(q.qid, q.options[k], now)
+            return {"ok": True, "question": "answered"}
+        if not of.bridge_online(now):
+            of.say("桥接离线，没提交", "err", now)
+            return {"ok": False, "error": "桥接离线"}
+        q.state, q.answer, q.done_at = "sending", q.options[k], now   # done_at 这里先记提交时间，超时用
+
+        def done(ok, error, qid=q.qid, answer=q.options[k]):
+            q2 = of.question(qid)
+            if ok:
+                of.answer_question(qid, answer)
+            else:
+                if q2 is not None and q2.state == "sending":
+                    q2.state = "pending"
+                of.say("没提交上: " + error[:14], "err")
+        self.queue({"type": "answer", "qid": q.qid, "bot": self.full_name(q.bot) if q.bot else "",
+                    "title": q.title, "option": q.options[k], "index": k}, now, cb=done, extra=10.0)
+        of.say("提交中…", "warn", now)
+        return {"ok": True, "question": "sending"}
 
     def poke(self, i, now=None):
         """点名盯第 i 个 bot：私聊它一句 poke_text，老板跑过去盯着它。"""
@@ -334,8 +369,14 @@ class Hub:
             elif roll < 0.6:
                 of.set_status(a, "typing")
                 of.add_message(a, random.choice(lines))
-            elif roll < 0.75:
+            elif roll < 0.66:
                 of.set_status(a, "waiting")
+            elif roll < 0.75 and not any(q.state != "answered" for q in of.questions):
+                title, opts = random.choice([
+                    ("正式切服：P0-4 打怪 FAIL，怎么走？按原门槛本该立刻回滚。",
+                     ["先维持 Go（同包演练已过，像验收方法问题）", "立刻回滚", "暂停切服，查完再定"]),
+                    ("正式切服窗口定哪个？", ["今晚（今晚到 22:00 前）", "明早 9:00", "周末"])])
+                of.set_question(f"demo{int(time.time())}", a, title, opts, 0)
             else:
                 of.set_status(a, "idle")
             # 偶尔全员卡住，演示"卡住"的效果
@@ -373,6 +414,21 @@ class Hub:
             of.set_remote(str(ev["name"]), str(ev.get("state", "")), now)
         elif t == "note":
             of.set_note(str(ev["name"]), str(ev.get("text", "")))
+        elif t == "question":                # 提问卡片：{"id", "name", "title", "options": [...], "recommended": 下标, "answer"?}
+            qid = str(ev["id"])
+            of.set_question(qid, str(ev.get("name", "")), str(ev.get("title", "")),
+                            list(ev.get("options", [])), int(ev.get("recommended", -1)), now)
+            if ev.get("answer"):             # 卡片上已经显示选了哪个（你在电脑上直接点的）
+                of.answer_question(qid, str(ev["answer"]), now)
+        elif t == "question_gone":           # 卡片不见了：{"id", "answer"?}
+            if ev.get("answer"):
+                of.answer_question(str(ev["id"]), str(ev["answer"]), now)
+            else:
+                q = of.question(str(ev["id"]))
+                if q is not None and q.state == "sending":
+                    of.answer_question(q.qid, q.answer, now)    # 替你点完卡片就收起来了：就是确认了
+                else:
+                    of.drop_question(str(ev["id"]))
         elif t == "bots":
             if ev.get("group"):
                 of.group = str(ev["group"])
@@ -440,7 +496,11 @@ class Hub:
         else:
             if of.view != "office":
                 return web.json_response({"ok": False, "error": "不在工位画面"})
-            i = self.painter().bot_at(of, float(body.get("x", -1)), float(body.get("y", -1)))
+            x, y = float(body.get("x", -1)), float(body.get("y", -1))
+            hit = self.painter().question_hit(of, x, y)          # 提问卡片 / 公告栏上的「待确认」优先
+            if hit is not None:
+                return web.json_response(self.question_tap(hit))
+            i = self.painter().bot_at(of, x, y)
         if i < 0:
             return web.json_response({"ok": False, "error": "没点中"})
         return web.json_response({"ok": self.poke(i), "bot": of.bots[i].name})
@@ -457,6 +517,8 @@ class Hub:
             return web.json_response({"ok": False, "error": "不在工位画面"})
         x, y = float(body.get("x", -1)), float(body.get("y", -1))
         theme = self.painter()
+        if of.question_open or theme.question_hit(of, x, y) is not None:
+            return web.json_response({"ok": False, "error": "提问卡片上不能录音"})   # 按住选项别变成录音
         i = theme.bot_at(of, x, y)
         if i < 0 and not theme.me_at(of, x, y):
             return web.json_response({"ok": False, "error": "没按中"})
@@ -599,7 +661,9 @@ class Hub:
         hub 自己记着推过去的最后一帧，下一条就以它为基准。每推一条都等 Core2 在 TCP 层把它全部确认收到，
         再算下一条：路上最多只有一帧，Core2 慢的时候中间的帧直接跳过，延迟不会越积越大。
         比每帧一问一答快：实测 Core2 收完一帧到发出下一个请求要 ~100ms（ESP32 HTTPClient 内部），推流没有这一步。
-        Core2 要整帧（刚连上、从设置回来）就断开重连：新连接第一条一定是整帧。"""
+        Core2 要整帧（刚连上、从设置回来）就断开重连：新连接第一条一定是整帧。
+        ?z=1：每条再用 deflate（raw，无 zlib 头）压一遍，抽鞭子这种大动画少传 2.4~3.3 倍，Core2 用 ROM 里的 tinfl 解。"""
+        deflate = request.query.get("z") == "1"
         resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
         resp.force_close()
         await resp.prepare(request)
@@ -623,6 +687,9 @@ class Hub:
                     await asyncio.sleep(0.005)
                 t_wait = time.time()
                 fid, body = self.frame_rle(base)
+                if deflate:
+                    z = zlib.compressobj(6, zlib.DEFLATED, -15)
+                    body = z.compress(body) + z.flush()
                 t_enc = time.time()
                 msg = struct.pack("<I", len(body)) + body
                 await resp.write(msg)

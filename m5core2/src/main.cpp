@@ -2,7 +2,7 @@
 //
 // Core2 的屏幕正好是 320x240，和 hub 渲染的画面一样大。这里不做任何绘制，只做三件事：
 //   1. 连 WiFi，连上 hub 的 /frame.stream 一直收画面：hub 有新帧就推一条增量帧——只含和上一帧相比变了的
-//      16x16 小块（RGB565 + 行程压缩），不用解 JPEG、没变的地方不重画；收数据在 core 0 的网络任务里，画图在 core 1；
+//      16x16 小块（RGB565 + 行程压缩，整条再 deflate 一遍），不用解 JPEG、没变的地方不重画；收数据在 core 0 的网络任务里，画图在 core 1；
 //   2. 把按键、滑动、摇一摇变成 hub 的 /api/button 请求（在后台任务里发，不卡画面）；
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
@@ -17,6 +17,7 @@
 #include <M5Unified.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp32/rom/miniz.h>                    // ROM 里自带的 tinfl：解 hub 推过来的 deflate 帧
 
 #include <algorithm>
 #include <utility>
@@ -34,13 +35,15 @@
 #endif
 
 static constexpr size_t FRAME_MAX = 256 * 1024;   // 一帧最坏情况（每个像素都和旁边不一样）约 230KB
-static constexpr const char *FW_VERSION = "2026.10.10-smooth";   // 报给 hub，排查时确认烧的是哪一版
+static constexpr const char *FW_VERSION = "2026.10.10-deflate";   // 报给 hub，排查时确认烧的是哪一版
 
 static M5Canvas canvas(&M5.Display);          // 屏幕上这一帧的完整副本：叠提示、恢复画面都靠它
 
 // 三个缓冲区：网络任务往 back 里下载，下完和 mid 交换；主循环把 mid 换到 front 再画。
 // 增量帧必须按顺序一帧不漏地画，所以主循环取走上一帧之前，网络任务不交下一帧（但可以先下载）。
 static uint8_t *fbuf[3];
+static uint8_t *zbuf;                         // 收到的 deflate 数据，网络任务解到 fbuf[back] 里
+static tinfl_decompressor *inflator;          // 解压状态约 11KB，放内部 RAM（不能放网络任务的栈上）
 static int fbufLen[3];
 static int backBuf = 0, midBuf = 1, frontBuf = 2;
 static volatile bool midFresh = false;
@@ -53,7 +56,7 @@ static bool noticeOnScreen = false;
 static volatile uint32_t netFails = 0;
 static uint32_t lastFrameAt = 0;
 // 性能统计（每 3 秒报给 hub）
-static volatile uint32_t stWaitMs = 0, stRecvMs = 0, stFetchN = 0;
+static volatile uint32_t stWaitMs = 0, stRecvMs = 0, stFetchN = 0, stInflateMs = 0, stZBytes = 0;
 static uint32_t stApplyMs = 0, stFrames = 0, stBytes = 0, stFull = 0, stAt = 0;
 static uint32_t noticeUntil = 0;
 static String notice;
@@ -169,7 +172,8 @@ static bool connectWifi(uint32_t timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------- 取画面（core 0 上的网络任务）
-// 连 hub 的 /frame.stream（HTTP/1.0，响应一直不结束），然后一条一条读：<长度 u32> + NRLE 增量帧。
+// 连 hub 的 /frame.stream?z=1（HTTP/1.0，响应一直不结束），然后一条一条读：<长度 u32> + deflate 过的 NRLE 增量帧，
+// 在这个任务里（core 0）解压，主循环（core 1）同时在画上一帧。
 // hub 每推一条都等这边在 TCP 层确认收到才推下一条，所以路上最多一帧。要整帧时断开重连（新连接第一条是整帧）。
 // 以前是每帧发一次 HTTP 请求：实测 ESP32 的 HTTPClient 收完一帧到发出下一个请求要 ~100ms，帧率卡在 9~10。
 static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
@@ -213,7 +217,7 @@ static bool openStream(WiFiClient &c) {
     c.stop();
     if (!parseHub(host, port) || !c.connect(host.c_str(), port, 2000)) return false;
     c.setNoDelay(true);
-    c.print("GET /frame.stream HTTP/1.0\r\nHost: " + host + "\r\n\r\n");
+    c.print("GET /frame.stream?z=1 HTTP/1.0\r\nHost: " + host + "\r\n\r\n");
     String line;                              // 读响应头，读到空行为止；第一行要是 200
     bool ok = false;
     int lines = 0;
@@ -268,7 +272,15 @@ static void netTask(void *) {
         uint32_t t0 = millis();
         bool ok = readFull(c, hdr, 4, 3000);  // hub 每帧都推（画面没变时只有十几个字节），3 秒没动静就是断了
         uint32_t t1 = millis(), n = ok ? rd32(hdr) : 0;
-        ok = ok && n >= 11 && n <= FRAME_MAX && readFull(c, fbuf[backBuf], n, 3000);
+        ok = ok && n >= 2 && n <= FRAME_MAX && readFull(c, zbuf, n, 3000);
+        uint32_t t2 = millis();
+        size_t inLen = n, outLen = FRAME_MAX;
+        if (ok) {
+            tinfl_init(inflator);
+            tinfl_status st = tinfl_decompress(inflator, zbuf, &inLen, fbuf[backBuf], fbuf[backBuf], &outLen,
+                                               TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            ok = st == TINFL_STATUS_DONE && outLen >= 11;
+        }
         if (!ok) {
             c.stop();
             open = false;
@@ -276,11 +288,13 @@ static void netTask(void *) {
             continue;
         }
         stWaitMs = stWaitMs + (t1 - t0);
-        stRecvMs = stRecvMs + (millis() - t1);
+        stRecvMs = stRecvMs + (t2 - t1);
+        stInflateMs = stInflateMs + (millis() - t2);
+        stZBytes = stZBytes + n;
         stFetchN = stFetchN + 1;
         netFails = 0;
         portENTER_CRITICAL(&frameMux);
-        fbufLen[backBuf] = n;
+        fbufLen[backBuf] = outLen;
         std::swap(backBuf, midBuf);
         midFresh = true;
         portEXIT_CRITICAL(&frameMux);
@@ -466,38 +480,6 @@ static void pushEv(EvType type, int x = 0, int y = 0) {
     evTail = next;
 }
 
-// 屏幕下方三个触摸键：手指要实实在在按住 BTN_PRESS_MS 才算（握机时蹭到、擦过去都不算），
-// 一个键触发后 BTN_COOLDOWN_MS 内不再触发（触摸屏抖一下变成连按两次）。
-static constexpr uint32_t BTN_PRESS_MS = 80;
-static constexpr uint32_t BTN_COOLDOWN_MS = 600;
-struct TouchKey {
-    bool fired = false;                       // 这次按住已经触发过了，松手前不再触发
-    uint32_t at = 0;                          // 上次触发的时间
-};
-static TouchKey keyA, keyB, keyC;
-
-static bool cooled(TouchKey &k) {
-    if (k.at && millis() - k.at < BTN_COOLDOWN_MS) return false;
-    k.at = millis();
-    return true;
-}
-
-// 按住满 BTN_PRESS_MS 就触发（不用等松手）
-static bool keyPressed(m5::Button_Class &b, TouchKey &k) {
-    if (!b.isPressed()) {
-        k.fired = false;
-        return false;
-    }
-    if (k.fired || !b.pressedFor(BTN_PRESS_MS)) return false;
-    k.fired = true;
-    return cooled(k);
-}
-
-// 点一下（按住至少 BTN_PRESS_MS、没到按住的时间就松手）：松手时触发
-static bool keyClicked(m5::Button_Class &b, TouchKey &k) {
-    return b.wasClicked() && b.wasReleaseFor(BTN_PRESS_MS) && cooled(k);
-}
-
 // 摇一摇：加速度超过 SHAKE_G 算「一下」（相隔至少 80ms，过了峰值回落才算下一下），
 // SHAKE_WINDOW_MS 内有 SHAKE_HITS 下才算在摇。碰一下、放到桌上、掉一下只有一两下，不会误触发。
 static constexpr uint32_t SHAKE_WINDOW_MS = 1200;
@@ -534,10 +516,10 @@ static void pollShake() {
 
 static void pollInput() {
     M5.update();
-    if (keyPressed(M5.BtnA, keyA)) { click(); pushEv(EV_ENCOURAGE); }   // 左：按稳了就算
-    if (keyPressed(M5.BtnB, keyB)) { click(); pushEv(EV_CHAT); }        // 中：按稳了就算
-    if (keyClicked(M5.BtnC, keyC)) { click(); pushEv(EV_SKIN); }        // 右：点一下换肤（松手时才知道不是按住）
-    if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }            // 按住右键 2 秒：设置
+    if (M5.BtnA.wasPressed()) { click(); pushEv(EV_ENCOURAGE); }     // 左：一按下就算
+    if (M5.BtnB.wasPressed()) { click(); pushEv(EV_CHAT); }          // 中：一按下就算
+    if (M5.BtnC.wasClicked()) { click(); pushEv(EV_SKIN); }          // 右：点一下换肤（松手时才知道不是按住）
+    if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }         // 按住右键 2 秒：设置
     pollShake();
 
     auto t = M5.Touch.getDetail();
@@ -618,12 +600,14 @@ static void reportStats() {
     String body = String("{\"ver\":\"") + FW_VERSION + "\",\"fps\":" + String(stFrames / sec, 1) +
                   ",\"wait_ms\":" + (stFetchN ? stWaitMs / stFetchN : 0) +
                   ",\"recv_ms\":" + (stFetchN ? stRecvMs / stFetchN : 0) +
+                  ",\"inflate_ms\":" + (stFetchN ? stInflateMs / stFetchN : 0) +
                   ",\"draw_ms\":" + (stFrames ? stApplyMs / stFrames : 0) +
+                  ",\"zkb_per_frame\":" + (stFetchN ? stZBytes / stFetchN / 1024 : 0) +
                   ",\"kb_per_frame\":" + (stFrames ? stBytes / stFrames / 1024 : 0) +
                   ",\"full_frames\":" + stFull + ",\"rssi\":" + WiFi.RSSI() +
                   ",\"free_heap\":" + ESP.getFreeHeap() + "}";
     stAt = millis();
-    stWaitMs = stRecvMs = stFetchN = 0;
+    stWaitMs = stRecvMs = stFetchN = stInflateMs = stZBytes = 0;
     stApplyMs = stFrames = stBytes = stFull = 0;
     postAsync("/api/device_stats", body);
 }
@@ -637,12 +621,13 @@ void setup() {
     Serial.begin(115200);
 
     for (auto &b : fbuf) b = (uint8_t *)ps_malloc(FRAME_MAX);  // Core2 有 8MB PSRAM
+    zbuf = (uint8_t *)ps_malloc(FRAME_MAX);
+    inflator = (tinfl_decompressor *)heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     canvas.setColorDepth(16);
     canvas.setPsram(true);
     canvas.createSprite(320, 240);
     canvas.setFont(&fonts::efontCN_14);        // 提示文字有中文
     M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
-    for (auto *b : {&M5.BtnA, &M5.BtnB, &M5.BtnC}) b->setDebounceThresh(30);   // 触摸屏偶尔抖一下，别当成松手再按
 
     settingsLoad();
     xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);   // 下载画面放在 core 0

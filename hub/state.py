@@ -90,6 +90,23 @@ class Handoff:
     t0: float
 
 
+QUESTION_DONE_SHOW = 120.0     # 确认完的问题在公告栏上再挂这么久（绿色「已确认：…」）
+
+
+@dataclass
+class Question:
+    """bot 在 Grok Bot 里弹出的带选项的提问卡片，要你选一个。"""
+    qid: str
+    bot: str                       # 工位短名（认不出是谁问的就是空字符串）
+    title: str
+    options: list
+    recommended: int = -1          # 建议选哪个（下标），没有建议是 -1
+    state: str = "pending"         # pending = 等你选 | sending = 桥接正在替你点 | answered = 确认完了
+    answer: str = ""
+    t0: float = 0.0
+    done_at: float = 0.0
+
+
 @dataclass
 class Office:
     group: str = "牛马办公室"
@@ -121,6 +138,8 @@ class Office:
     aliases: dict = field(default_factory=dict)       # 配置里的名字映射 {完整名: 短名}
     auto_short: bool = True
     full2short: dict = field(default_factory=dict)    # 已经见过的 {完整名: 短名}
+    questions: list = field(default_factory=list)     # 提问卡片 [Question]，先来的在前
+    question_open: str = ""        # 屏幕上点开了哪张提问卡片（qid），空 = 没开
 
     # ---- 名字映射 ----
     def short(self, name):
@@ -261,6 +280,64 @@ class Office:
             if self.effective_status(b, now) == "waiting":
                 out.append((i, b.wait_note or "等你批准"))
         return out
+
+    def board_items(self, now):
+        """公告栏上的每一行，要紧的在前：[{"kind": question|approval|confirmed, "bot": 下标或 -1, "text", "qid"}]。
+        question = 等你选的提问卡片（点一下打开选项）；confirmed = 刚确认完的，挂一会儿。"""
+        out = []
+        for q in self.questions:
+            if q.state != "answered":
+                text = ("提交中… " if q.state == "sending" else "待确认：") + q.title
+                out.append({"kind": "question", "bot": self.index(q.bot), "text": text, "qid": q.qid})
+        out += [{"kind": "approval", "bot": i, "text": t, "qid": ""} for i, t in self.notices(now)]
+        for q in reversed(self.questions):
+            if q.state == "answered" and now - q.done_at < QUESTION_DONE_SHOW:
+                out.append({"kind": "confirmed", "bot": self.index(q.bot), "text": f"已确认：{q.answer}（{q.title}）",
+                            "qid": q.qid})
+        return out
+
+    # ---- 提问卡片 ----
+    def question(self, qid):
+        return next((q for q in self.questions if q.qid == qid), None)
+
+    def set_question(self, qid, bot, title, options, recommended=-1, now=None):
+        """桥接看到一张等你选的提问卡片。同一张（qid 相同）再报一次只更新内容。"""
+        now = now or time.time()
+        bot = self.short(bot) if bot else ""
+        title = " ".join(str(title).split())[:200]
+        options = [" ".join(str(o).split())[:120] for o in options if str(o).strip()][:6]
+        q = self.question(qid)
+        if q is None:
+            self.questions.append(Question(qid, bot, title, options, recommended, t0=now))
+            self.questions = self.questions[-12:]
+            self.last_activity = now
+            self.say("有问题等你确认", "warn", now)
+        elif q.state != "answered":
+            q.bot, q.title, q.options, q.recommended = bot or q.bot, title, options, recommended
+            if q.state == "sending" and now - q.done_at > 30:
+                q.state = "pending"                       # 替你点了半天卡片还在：当没点成
+        return q
+
+    def answer_question(self, qid, answer, now=None):
+        """确认完了（你在屏幕上选的、或者在电脑上直接点的）。"""
+        now = now or time.time()
+        q = self.question(qid)
+        if q is None:
+            return
+        first = q.state != "answered"
+        q.state, q.answer, q.done_at = "answered", " ".join(str(answer).split())[:120] or q.answer or "已处理", now
+        if self.question_open == qid:
+            self.question_open = ""
+        if first:
+            self.say("已确认：" + q.answer, "ok", now)
+
+    def drop_question(self, qid):
+        """卡片从界面上消失了、又不知道选了什么：没确认完的直接拿掉。"""
+        q = self.question(qid)
+        if q is not None and q.state != "answered":
+            self.questions.remove(q)
+        if self.question_open == qid:
+            self.question_open = ""
 
     def add_message(self, sender, text, now=None, private=False):
         now = now or time.time()
@@ -438,6 +515,9 @@ class Office:
             "usage": self.usage,
             "remote": {n: st["state"] for n, st in self.remote_state.items()},
             "notices": [{"bot": self.bots[i].name, "text": t} for i, t in self.notices(now)],
+            "questions": [{"id": q.qid, "bot": q.bot, "title": q.title, "options": q.options,
+                           "recommended": q.recommended, "state": q.state, "answer": q.answer}
+                          for q in self.questions if q.state != "answered" or now - q.done_at < QUESTION_DONE_SHOW],
             "voice": self.voice,
             "messages": [{"sender": m.sender, "text": m.text if self.show_chat else "…"} for m in list(self.messages)[-10:]],
         }

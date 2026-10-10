@@ -16,6 +16,7 @@ Grok Bot 没有开放 API，所以这里用 Windows 的 UI 自动化直接操作
                                      只测试"按住说话"：把录音（默认一段 2 秒的小声提示音）播放进虚拟麦克风，
                                      让 Grok 听写，然后取消、清掉转出来的字（不发送）；不写名字 = 群聊
     python bridge.py --dry-run       只打印解析结果，不上报
+    python bridge.py --questions     只打印界面上认出来的提问卡片（bot 问你、让你选的那种），校准用
 
 Python 3.11+ 自带 tomllib，更低版本请 pip install tomli。电脑锁屏、或远程桌面断开时，Windows 不允许模拟按键，发消息会失败。
 """
@@ -268,6 +269,47 @@ def parse_row(row_name, anchor_name, chips):
     return who, text, ts
 
 
+# ---------------------------------------------------------------- 提问卡片（bot 问你、给几个选项让你选）
+# 卡片外层控件的 ClassName 里含这些字就当提问卡片（不分大小写）。Grok Bot 改版对不上时，在 config.toml 的
+# question_class 里改：卡片显示在屏幕上时跑 python bridge.py --probe，在 uia_dump.txt 里找卡片那一层的 class
+QUESTION_CLASS = ("question", "ask-user", "askuser", "ask_user")
+QUESTION_SKIP = {"提交", "确认", "确定", "跳过", "取消", "关闭", "其他", "其它", "自定义", "发送", "复制",
+                 "Submit", "Confirm", "Skip", "Cancel", "Close", "Other", "Send", "Copy"}
+QUESTION_SUBMIT = ("提交", "确认", "确定", "发送", "Submit", "Confirm", "Send")
+OPTION_LETTER_RE = re.compile(r"^\s*([A-Fa-f])\s*[.、:：)）]\s*")
+REC_WORD_RE = re.compile(r"[（(]?\s*(?:建议|推荐|Recommended)\s*[)）]?\s*[：:]?\s*")
+REC_LETTER_RE = re.compile(r"(?:建议|推荐|Recommended)\s*(?:选)?\s*([A-Fa-f])(?![A-Za-z])")
+
+
+def parse_question(texts, buttons, selected=()):
+    """一张提问卡片里的文字和按钮 -> {"qid", "title", "options": [显示用], "raw": [按钮原名], "recommended", "answer"}；
+    不像提问（选项少于 2 个）返回 None。"""
+    raw, seen = [], set()
+    for b in buttons:
+        b = " ".join(str(b).split())
+        if b and b not in seen and b not in QUESTION_SKIP:
+            seen.add(b)
+            raw.append(b)
+    if len(raw) < 2:
+        return None
+    texts = [" ".join(str(t).split()) for t in texts if str(t).strip() and " ".join(str(t).split()) not in seen]
+    title = next((t for t in texts if t.endswith(("？", "?"))), "") or max(texts, key=len, default="")
+    rec, options = -1, []
+    for k, b in enumerate(raw):
+        label = OPTION_LETTER_RE.sub("", b)
+        if REC_WORD_RE.search(label):
+            rec = k if rec < 0 else rec
+            label = REC_WORD_RE.sub("", label).strip()
+        options.append(label or b)
+    if rec < 0:                                           # 「建议 A：…」写在正文里
+        m = next((REC_LETTER_RE.search(t) for t in texts if REC_LETTER_RE.search(t)), None)
+        if m and ord(m.group(1).upper()) - 65 < len(raw):
+            rec = ord(m.group(1).upper()) - 65
+    answer = next((options[raw.index(s)] for s in selected if s in raw), "")
+    qid = hashlib.sha1((title + "\n" + "\n".join(raw)).encode("utf-8")).hexdigest()[:12]
+    return {"qid": qid, "title": title, "options": options, "raw": raw, "recommended": rec, "answer": answer}
+
+
 def members_from_title(title, humans):
     """未命名群聊的标题就是成员列表，用 、 分隔；去掉你自己。"""
     if "、" not in title:
@@ -427,6 +469,7 @@ class GrokWindow:
         self.title = cfg.get("window_title", "Grok Bot")
         self.win = None
         self.group_title = cfg.get("group", "")   # 群聊的标题，主循环里看到群聊时更新
+        self.qclass = tuple(s.lower() for s in cfg.get("question_class", QUESTION_CLASS) if s)
 
     def find(self):
         auto = self.auto
@@ -466,7 +509,7 @@ class GrokWindow:
         win = self.find()
         if win is None:
             return None
-        title, sidebar, rows, seen_input, agent_names = "", [], [], False, []
+        title, sidebar, rows, seen_input, agent_names, cards = "", [], [], False, [], []
         for c in self._walk(win):
             try:
                 cls, ctype = c.ClassName or "", c.ControlTypeName
@@ -497,9 +540,120 @@ class GrokWindow:
                     elif "sand-inserted-chip" in dc:
                         chips.append(d.Name or "")
                 rows.append((c.Name or "", anchor, chips))
+            elif self.qclass and ctype in ("GroupControl", "CustomControl", "PaneControl", "ListControl") \
+                    and any(f in cls.lower() for f in self.qclass):
+                cards.append(c)
         if not title and not sidebar:
             return None                       # 最小化时 Chromium 不生成无障碍树
-        return {"title": title, "sidebar": sidebar, "rows": rows, "agents": agent_names}
+        return {"title": title, "sidebar": sidebar, "rows": rows, "agents": agent_names,
+                "questions": [q for q, _ in self._read_cards(cards)]}
+
+    _OPTION_TYPES = ("ButtonControl", "RadioButtonControl", "ListItemControl", "CheckBoxControl")
+
+    def _read_cards(self, cards):
+        """提问卡片控件 -> [(parse_question 的结果, 卡片控件)]。卡片里面套着的小块（选项列表之类）也会被匹配上，
+        只留最外层；同一张卡片只留一次。"""
+        rects = []
+        for c in cards:
+            try:
+                r = c.BoundingRectangle
+                rects.append((r.left, r.top, r.right, r.bottom))
+            except Exception:
+                rects.append(None)
+        out, seen = [], set()
+        for k, c in enumerate(cards):
+            rk = rects[k]
+            if rk is None or any(j != k and rj and rj != rk and rj[0] <= rk[0] and rj[1] <= rk[1]
+                                 and rj[2] >= rk[2] and rj[3] >= rk[3] for j, rj in enumerate(rects)):
+                continue                                  # 被别的卡片控件包着：是里面的一块
+            texts, buttons, selected = [], [], []
+            for d in self._walk(c, 0, 14):
+                try:
+                    dt, name = d.ControlTypeName, (d.Name or "").strip()
+                except Exception:
+                    continue
+                if not name:
+                    continue
+                if dt == "TextControl":
+                    texts.append(name)
+                elif dt in self._OPTION_TYPES:
+                    buttons.append(name)
+                    if self._is_selected(d):
+                        selected.append(" ".join(name.split()))
+            q = parse_question(texts, buttons, selected)
+            if q and q["qid"] not in seen:
+                seen.add(q["qid"])
+                out.append((q, c))
+        return out
+
+    def _is_selected(self, c):
+        P = self.auto.PatternId
+        try:
+            p = c.GetPattern(P.SelectionItemPattern)
+            if p and p.IsSelected:
+                return True
+        except Exception:
+            pass
+        try:
+            p = c.GetPattern(P.TogglePattern)
+            if p and p.ToggleState == 1:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def question_cards(self):
+        """现在界面上的提问卡片 [(解析结果, 卡片控件)]。"""
+        win = self.find()
+        if win is None:
+            return []
+        cards = []
+        for c in self._walk(win):
+            try:
+                if c.ControlTypeName in ("GroupControl", "CustomControl", "PaneControl", "ListControl") \
+                        and any(f in (c.ClassName or "").lower() for f in self.qclass):
+                    cards.append(c)
+            except Exception:
+                continue
+        return self._read_cards(cards)
+
+    def answer(self, qid, index, option, bot=""):
+        """替你在提问卡片上选第 index 个选项（必要时再点「提交」）。卡片不在当前聊天里就先切到 bot 的单聊找。"""
+        found = next(((q, c) for q, c in self.question_cards() if q["qid"] == qid), None)
+        back = ""
+        if found is None and bot:
+            back = self.heading()
+            if self.open_chat(bot, keys=False):               # 只点侧边栏，不抢前台
+                found = next(((q, c) for q, c in self.question_cards() if q["qid"] == qid), None)
+        try:
+            self._answer_card(found, index, option)
+        finally:
+            if back:
+                self._go_back(back, bot)
+
+    def _answer_card(self, found, index, option):
+        if found is None:
+            raise RuntimeError("界面上找不到这张提问卡片")
+        q, card = found
+        if not 0 <= index < len(q["raw"]) or q["options"][index] != option:
+            raise RuntimeError("卡片上的选项变了")
+        raw = q["raw"][index]
+        target = submit = None
+        for d in self._walk(card, 0, 14):
+            try:
+                dt, name = d.ControlTypeName, " ".join((d.Name or "").split())
+            except Exception:
+                continue
+            if dt in self._OPTION_TYPES and name == raw and target is None:
+                target = d
+            elif dt == "ButtonControl" and name in QUESTION_SUBMIT:
+                submit = d
+        if target is None:
+            raise RuntimeError("找不到这个选项的按钮")
+        self._invoke(target)
+        if submit is not None:                            # 先选再提交的卡片
+            time.sleep(0.3)
+            self._invoke(submit)
 
     def capture(self):
         """用 PrintWindow 截 Grok Bot 窗口，窗口被别的窗口挡住也能截到。返回 (PIL 图, 窗口左上角屏幕坐标)。"""
@@ -912,6 +1066,7 @@ def main():
     ap.add_argument("--voice-test", nargs="?", const="", metavar="NAME")
     ap.add_argument("--wav", metavar="FILE", help="--voice-test 用的录音（16 位 PCM WAV）")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--questions", action="store_true", help="只打印界面上认出来的提问卡片（校准 question_class 用）")
     args = ap.parse_args()
     cfg_path = Path(args.config)
     if not cfg_path.exists() and cfg_path == HERE / "config.toml" and (HERE / "config.example.toml").exists():
@@ -928,6 +1083,12 @@ def main():
         out = HERE / "uia_dump.txt"
         found, n = gw.probe(out)
         print(f"已导出 {n} 行到 {out}" + ("" if found else "（没找到目标窗口，文件里有全部窗口标题）"))
+        return
+    if args.questions:
+        cards = gw.question_cards()
+        print(json.dumps([q for q, _ in cards], ensure_ascii=False, indent=1) if cards else
+              f"没认出提问卡片（question_class = {list(gw.qclass)}）。卡片显示着的时候跑 --probe，"
+              "在 uia_dump.txt 里找包着问题和选项的那一层，把它 class 里的一段填到 config.toml 的 question_class")
         return
     if args.send:
         gw.send(args.send)
@@ -956,6 +1117,7 @@ def main():
     last_title = None
     last_members = None
     last_notes = {}
+    last_questions = {}                     # 报过的提问卡片 {qid: (在哪个聊天看到的, 内容)}
     last_remote = (None, 0.0)
     colors, last_color_scan, sent_colors = {}, 0.0, None
     usage_box, usage_next = {}, 0.0
@@ -980,10 +1142,13 @@ def main():
             if args.dry_run:
                 time.sleep(poll)
             for c in cmds:
-                if c.get("type") not in ("send", "send_private", "voice_play"):
+                if c.get("type") not in ("send", "send_private", "voice_play", "answer"):
                     continue
                 try:
-                    if c["type"] == "voice_play":
+                    if c["type"] == "answer":                 # 你在屏幕上选了提问卡片的某个选项
+                        gw.answer(c["qid"], int(c["index"]), c["option"], c.get("bot", ""))
+                        print(f"已替你选：{c['option']}（{c.get('title', '')}）")
+                    elif c["type"] == "voice_play":
                         gw.voice_play(c.get("to"), hub.clip(c["clip"]))
                         print(f"已说给 {c.get('to') or '群聊'}（{c.get('seconds')} 秒，Grok 听写）")
                     elif c["type"] == "send_private":
@@ -1059,6 +1224,7 @@ def main():
                                  "bots": [{"name": n, "color": use[n]} if n in use else n for n in bots]}])
                 tracker.statuses.clear()          # hub 可能重启过，状态重新报一遍
                 last_notes.clear()
+                last_questions.clear()            # 提问卡片也重新报一遍
                 last_bots, last_hello = bots, now
 
             side = parse_sidebar(snap["sidebar"])
@@ -1090,6 +1256,19 @@ def main():
                     if previews.get(n) != t and not t.startswith(("你 ", "你:", "你：")):
                         events.append({"type": "message", "sender": n, "text": t[:500], "private": True})
             previews = pv
+            # 提问卡片：新出现的 / 选项或已选的变了就报；同一个聊天里卡片不见了报 gone（切到别的聊天看不到不算）
+            now_q = {q["qid"]: q for q in snap.get("questions", [])}
+            for qid, q in now_q.items():
+                sig = (q["title"], tuple(q["options"]), q["recommended"], q["answer"])
+                if last_questions.get(qid, (None, None))[1] != sig:
+                    events.append({"type": "question", "id": qid, "name": "" if is_group else title,
+                                   "title": q["title"], "options": q["options"],
+                                   "recommended": q["recommended"], "answer": q["answer"]})
+                last_questions[qid] = (title, sig)
+            for qid, (where, _sig) in list(last_questions.items()):
+                if qid not in now_q and where == title:
+                    events.append({"type": "question_gone", "id": qid})
+                    del last_questions[qid]
             # 公告：在等你批准的 bot，把侧边栏里它的预览（"需要批准：…"）报上去
             for n in bots:
                 note = pv.get(n, "") if statuses.get(n) == "waiting" else ""

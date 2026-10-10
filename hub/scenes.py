@@ -746,41 +746,127 @@ class Theme:
         d.rounded_rectangle([(W - tw) / 2 - 10, H - 30, (W + tw) / 2 + 10, H - 8], 6, fill=(20, 22, 30), outline=col)
         d.text((W / 2, H - 19), text, font=self.font, fill=col, anchor="mm")
 
-    # ---- 公告栏：等你批准的事挂在屏幕顶上 ----
+    # ---- 公告栏：等你确认 / 批准的事挂在屏幕顶上 ----
+    BOARD_ROWS = 2
+    BOARD_BG = {"question": (255, 172, 84), "approval": (255, 226, 110), "confirmed": (160, 228, 170)}
+    BOARD_TAP = "点开选"
+
     def notice_board(self, img, d, office, now):
-        items = office.notices(now)
+        items = office.board_items(now)
         if not items:
             return 0
-        rows = items[:2]
+        rows = items[:self.BOARD_ROWS]
         h = 15 * len(rows) + 2
-        d.rectangle([0, 0, W, h], (255, 226, 110))
+        d.rectangle([0, 0, W, h], self.BOARD_BG[rows[-1]["kind"]])
         d.line([(0, h), (W, h)], (150, 110, 20))
-        for k, (i, text) in enumerate(rows):
+        for k, it in enumerate(rows):
             y = 1 + k * 15
-            bot = office.bots[i]
-            d.ellipse([4, y + 3, 11, y + 10], RED, outline=INK)                    # 图钉
+            bg = self.BOARD_BG[it["kind"]]
+            d.rectangle([0, y - 1 if k else 0, W, y + 14], bg)
+            pin = {"question": RED, "approval": RED, "confirmed": (40, 150, 70)}[it["kind"]]
+            d.ellipse([4, y + 3, 11, y + 10], pin, outline=INK)                    # 图钉
             d.line([(8, y + 10), (10, y + 13)], INK)
-            head = self.fit(bot.name, 54) + "："
-            hx = 15
-            d.rectangle([hx, y + 2, hx + 3, y + 11], bot_pal(bot)["fur"])
-            d.text((hx + 6, y), head, font=self.font, fill=INK)
-            x0 = hx + 6 + self.font.getlength(head)
-            more = f"+{len(items) - 2}" if k == len(rows) - 1 and len(items) > 2 else ""
+            x0 = 15
+            if it["bot"] >= 0:
+                bot = office.bots[it["bot"]]
+                head = self.fit(bot.name, 54) + "："
+                d.rectangle([x0, y + 2, x0 + 3, y + 11], bot_pal(bot)["fur"])
+                d.text((x0 + 6, y), head, font=self.font, fill=INK)
+                x0 += 6 + self.font.getlength(head)
+            more = f"+{len(items) - len(rows)}" if k == len(rows) - 1 and len(items) > len(rows) else ""
             x1 = W - 4 - (self.font.getlength(more) + 4 if more else 0)
+            if it["kind"] == "question" and not it["text"].startswith("提交中"):  # 能点：右边标一个「点开选 ▸」
+                tag = self.BOARD_TAP
+                tl = self.font.getlength(tag)
+                d.rounded_rectangle([x1 - tl - 6, y + 1, x1, y + 13], 3, fill=INK)
+                d.text((x1 - tl - 3, y), tag, font=self.font, fill=(255, 210, 120))
+                x1 -= tl + 10
+            text = it["text"]
             tw = self.font.getlength(text)
             if tw <= x1 - x0:
                 d.text((x0, y), text, font=self.font, fill=INK)
             else:                                                                   # 太长：跑马灯
-                lane = Image.new("RGB", (int(x1 - x0), 15), (255, 226, 110))
+                lane = Image.new("RGB", (int(x1 - x0), 15), bg)
                 ld = ImageDraw.Draw(lane)
                 period = tw + 40
-                off = (now * 30 + i * 37) % period
+                off = (now * 30 + k * 37) % period
                 for rep_x in (-off, period - off):
                     ld.text((rep_x, 0), text, font=self.font, fill=INK)
                 img.paste(lane, (int(x0), y))
             if more:
                 d.text((W - 4, y), more, font=self.font, fill=(120, 60, 10), anchor="ra")
         return h + 1
+
+    # ---- 提问卡片：点开公告栏上的「待确认」，在屏幕上选一个选项 ----
+    def question_layout(self, office):
+        """打开着的提问卡片怎么摆：画图和点屏幕判断共用。没打开返回 None。"""
+        q = office.question(office.question_open)
+        if q is None or q.state == "answered":
+            return None
+        x0, x1 = 6, W - 6
+        lines = self.wrap(q.title, x1 - x0 - 16, max_lines=3)
+        y = 6 + 22 + 15 * len(lines) + 4                     # 标题栏 + 问题
+        opts = []
+        for k, text in enumerate(q.options):                # 选项太长就折成两行
+            indent = 8 + (self.font.getlength("建议") + 7 if k == q.recommended else 0)
+            olines = self.wrap(f"{chr(65 + k)}. {text}", x1 - x0 - 16 - 16, first_indent=indent, max_lines=2)
+            oh = 8 + 14 * len(olines)
+            if y + oh > H - 8:
+                break
+            opts.append(((x0 + 8, y, x1 - 8, y + oh), k, olines))
+            y += oh + 4
+        return {"q": q, "card": (x0, 6, x1, y + 4), "close": (x1 - 28, 6, x1, 26), "lines": lines, "opts": opts}
+
+    def question_hit(self, office, x, y):
+        """点屏幕 (x, y)：("option", qid, 下标) | ("close",) | ("open", qid) | None（交给点牛马）。"""
+        lay = self.question_layout(office)
+        if lay is not None:
+            q = lay["q"]
+            for (l, t, r, b), k, _ in lay["opts"]:
+                if l <= x <= r and t <= y <= b:
+                    return ("option", q.qid, k) if q.state == "pending" else ("close",)
+            c = lay["close"]
+            if c[0] <= x <= c[2] and c[1] <= y <= c[3]:
+                return ("close",)
+            l, t, r, b = lay["card"]
+            return None if l <= x <= r and t <= y <= b else ("close",)   # 点卡片外面 = 关掉
+        for k, it in enumerate(office.board_items(time.time())[:self.BOARD_ROWS]):
+            if it["kind"] == "question" and 1 + k * 15 - 2 <= y <= 1 + k * 15 + 16:
+                return ("open", it["qid"])
+        return None
+
+    def question_card(self, d, office, now):
+        lay = self.question_layout(office)
+        if lay is None:
+            return
+        q = lay["q"]
+        x0, y0, x1, y1 = lay["card"]
+        d.rounded_rectangle([x0 + 2, y0 + 3, x1 + 2, y1 + 3], 8, fill=(0, 0, 0))                # 影子
+        d.rounded_rectangle([x0, y0, x1, y1], 8, fill=(250, 246, 236), outline=(255, 150, 60), width=2)
+        d.rounded_rectangle([x0, y0, x1, y0 + 20], 8, fill=(255, 172, 84))
+        d.rectangle([x0, y0 + 12, x1, y0 + 20], (255, 172, 84))
+        who = (q.bot + " ") if q.bot else ""
+        head = "提交中…" if q.state == "sending" else "问你，选一个："
+        d.text((x0 + 8, y0 + 10), who + head, font=self.font, fill=INK, anchor="lm")
+        cl, ct, cr, cb = lay["close"]
+        d.text(((cl + cr) / 2, (ct + cb) / 2 - 1), "×", font=self.font, fill=INK, anchor="mm")
+        for k, line in enumerate(lay["lines"]):
+            d.text((x0 + 8, y0 + 24 + k * 15), line, font=self.font, fill=INK)
+        sending = q.state == "sending"
+        for (l, t, r, b), k, olines in lay["opts"]:
+            rec = k == q.recommended
+            fill = (255, 236, 200) if rec else (232, 236, 246)
+            d.rounded_rectangle([l, t, r, b], 5, fill=fill, outline=(220, 120, 40) if rec else (150, 156, 175),
+                                width=2 if rec else 1)
+            tx = l + 8
+            if rec:
+                tl = self.font.getlength("建议")
+                d.rounded_rectangle([tx - 3, t + 4, tx + tl + 3, t + 18], 3, fill=(220, 120, 40))
+                d.text((tx, t + 11), "建议", font=self.font, fill=WHITE, anchor="lm")
+            for j, line in enumerate(olines):
+                lx = tx + (self.font.getlength("建议") + 7 if rec and j == 0 else 0)
+                d.text((lx, t + 11 + 14 * j), line, font=self.font, fill=(130, 130, 140) if sending else INK, anchor="lm")
+
 
     # ---- 录音状态条：按住牛马 / 我 发语音时 ----
     def voice_badge(self, d, office, now, top):
@@ -813,6 +899,7 @@ class Theme:
         self.rush_banner(d, office, now)
         self.voice_badge(d, office, now, top)
         self.quota_overlay(d, office, now)
+        self.question_card(d, office, now)
         self.toast(d, office, now)
         tw = now - office.whip_t0
         if T_WHIP_HIT <= tw < T_WHIP_HIT + 0.16:                          # 挨抽瞬间整屏一闪
