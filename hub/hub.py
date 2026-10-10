@@ -509,8 +509,8 @@ class Hub:
             self._jpg = (fid, q, data)
         return fid, data
 
-    # ---- Core2 用的增量画面：只传变了的 40x40 小块，RGB565 + 行程压缩，Core2 不用解 JPEG ----
-    RLE_TILE = 40
+    # ---- Core2 用的增量画面：只传变了的 16x16 小块，RGB565 + 行程压缩，Core2 不用解 JPEG ----
+    RLE_TILE = 16                      # 以前是 40：抽鞭子时一帧 40~60KB，改小块后少传 20~40%（Core2 不用改，矩形大小在数据里）
 
     def _frame565(self):
         """当前帧的 RGB565（按帧号缓存最近 40 帧）。"""

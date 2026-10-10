@@ -2,8 +2,8 @@
 //
 // Core2 的屏幕正好是 320x240，和 hub 渲染的画面一样大。这里不做任何绘制，只做三件事：
 //   1. 连 WiFi，连上 hub 的 /frame.stream 一直收画面：hub 有新帧就推一条增量帧——只含和上一帧相比变了的
-//      40x40 小块（RGB565 + 行程压缩），不用解 JPEG、没变的地方不重画；收数据在 core 0 的网络任务里，画图在 core 1；
-//   2. 把按键、滑动、摇一摇变成 hub 的 /api/button 请求；
+//      16x16 小块（RGB565 + 行程压缩），不用解 JPEG、没变的地方不重画；收数据在 core 0 的网络任务里，画图在 core 1；
+//   2. 把按键、滑动、摇一摇变成 hub 的 /api/button 请求（在后台任务里发，不卡画面）；
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
 // 操作：
@@ -12,7 +12,7 @@
 //   点一下屏幕上的某只牛马  点名：老板跑过去盯着它，并私聊它一句（hub 的 [buttons] poke_text）
 //   按住某只牛马 / 按住「我」 说话私聊它 / 发到群里：用 Core2 自带的麦克风录，松手把录音传给 hub，
 //                            由 Grok Bot 听写成文字发出去（跑 Grok Bot 的电脑上要装虚拟麦克风，见 README）
-//   摇一摇设备            抽鞭子
+//   摇一摇设备            抽鞭子（要来回摇几下才算，碰一下、放桌上不算）
 //   按住右键 2 秒          设置：选 WiFi、输密码、改 hub 地址和口令（存在 Core2 里，不用重新编译）
 #include <M5Unified.h>
 #include <HTTPClient.h>
@@ -29,8 +29,12 @@
 #endif
 #include "settings.h"
 
+#ifndef SHAKE_HITS
+#define SHAKE_HITS 3                                // 旧的 niuma_config.h 里没有这项
+#endif
+
 static constexpr size_t FRAME_MAX = 256 * 1024;   // 一帧最坏情况（每个像素都和旁边不一样）约 230KB
-static constexpr const char *FW_VERSION = "2026.10.10-stream";   // 报给 hub，排查时确认烧的是哪一版
+static constexpr const char *FW_VERSION = "2026.10.10-smooth";   // 报给 hub，排查时确认烧的是哪一版
 
 static M5Canvas canvas(&M5.Display);          // 屏幕上这一帧的完整副本：叠提示、恢复画面都靠它
 
@@ -55,6 +59,8 @@ static uint32_t noticeUntil = 0;
 static String notice;
 static uint32_t vibeOffAt = 0;
 static uint32_t lastShake = 0;
+static volatile bool hubErr = false;          // 后台发请求出了错：错误码交给主循环显示（showNotice 只在主循环里调）
+static volatile int hubErrCode = 0;
 static bool wantSettings = false;             // 要进设置界面（按住右键，或在连不上的画面上点了屏幕）
 static void pollInput();                      // 取画面时也要读输入，定义在后面
 
@@ -296,9 +302,10 @@ static bool takeFrame() {
 
 // 画一帧：b"NRLE" <帧号 u32><整帧 u8><矩形数 u16>，每个矩形 <x y w h u16><字节数 u32> + 行程数据
 // （每段 3 字节：个数-1、RGB565 低字节、高字节；逐行）。每个矩形先解到内存里，再写进 canvas 和屏幕。
-static uint16_t tileBuf[320 * 40];
+// 解出来的像素按屏幕 / canvas 自己的字节序（高字节在前）存，写进去是直接拷贝，不用逐点转换。
+static uint16_t tileBuf[320 * 40];           // hub 现在发 16 行高的矩形；旧版 hub 是 40 行
 
-static bool applyFrame(const uint8_t *b, int len, bool toLcd) {
+static bool applyRects(const uint8_t *b, int len, bool toLcd) {
     if (len < 11 || memcmp(b, "NRLE", 4) != 0) return false;
     int n = rd16(b + 9);
     const uint8_t *p = b + 11, *end = b + len;
@@ -311,16 +318,23 @@ static bool applyFrame(const uint8_t *b, int len, bool toLcd) {
         int o = 0;
         for (const uint8_t *q = p; q < p + nb; q += 3) {
             int cnt = q[0] + 1;
-            uint16_t c = q[1] | (q[2] << 8);
+            uint16_t c = q[2] | (q[1] << 8);     // 存成 swap565
             if (o + cnt > w * h) return false;
             for (int k = 0; k < cnt; k++) tileBuf[o++] = c;
         }
         if (o != w * h) return false;
         p += nb;
-        canvas.pushImage(x, y, w, h, (const lgfx::rgb565_t *)tileBuf);
-        if (toLcd) M5.Display.pushImage(x, y, w, h, (const lgfx::rgb565_t *)tileBuf);
+        canvas.pushImage(x, y, w, h, (const lgfx::swap565_t *)tileBuf);
+        if (toLcd) M5.Display.pushImage(x, y, w, h, (const lgfx::swap565_t *)tileBuf);
     }
     return true;
+}
+
+static bool applyFrame(const uint8_t *b, int len, bool toLcd) {
+    if (toLcd) M5.Display.startWrite();       // 所有矩形在一次 SPI 事务里写完，不用每块都重新占总线
+    bool ok = applyRects(b, len, toLcd);
+    if (toLcd) M5.Display.endWrite();
+    return ok;
 }
 
 static void drawNotice() {
@@ -343,9 +357,37 @@ static bool postHub(const char *path, const String &body, String *reply = nullpt
     int code = http.POST(body);
     if (reply && code == 200) *reply = http.getString();
     http.end();
-    if (code == 401) showNotice("Bad token");
-    else if (code != 200) showNotice("Hub error " + String(code));
+    if (code != 200) {                        // 可能在后台任务里：只记下来，主循环去显示
+        hubErrCode = code;
+        hubErr = true;
+    }
     return code == 200;
+}
+
+// 按键、点名、滑动、性能统计都放到后台任务（core 0）里发：一次 POST 要 100ms 以上，
+// 以前在主循环里发，按一下键画面就停一下（换肤时最明显）。按顺序一条条发，队列满了就丢。
+struct HubReq {
+    char path[24];
+    char body[232];
+};
+static QueueHandle_t reqQ = nullptr;
+static volatile bool sending = false;         // 后台任务正在发：进设置前要等它发完（设置会改 hub 地址）
+
+static void postAsync(const char *path, const String &body) {
+    HubReq r;
+    strlcpy(r.path, path, sizeof r.path);
+    strlcpy(r.body, body.c_str(), sizeof r.body);
+    if (reqQ) xQueueSend(reqQ, &r, 0);
+}
+
+static void sendTask(void *) {
+    HubReq r;
+    for (;;) {
+        if (xQueueReceive(reqQ, &r, portMAX_DELAY) != pdTRUE) continue;
+        sending = true;
+        if (!netPause && WiFi.status() == WL_CONNECTED) postHub(r.path, r.body);
+        sending = false;
+    }
 }
 
 // ---------------------------------------------------------------- 按住说话
@@ -400,16 +442,16 @@ static void recordVoice() {
 }
 
 // 往 hub 发按键。button = "dial" | "back" | "notify" | "chat"；dial != 0 时发滚轮转动（度）。
-static bool sendButton(const char *button, int dial = 0) {
+static void sendButton(const char *button, int dial = 0) {
     String body = dial ? String("{\"dial\":") + dial + "}" : String("{\"button\":\"") + button + "\"}";
-    return postHub("/api/button", body);
+    postAsync("/api/button", body);
 }
 
 // ---------------------------------------------------------------- 输入
 // 读输入（pollInput）和发请求（processInput）分开：pollInput 每几毫秒调一次（取画面、等下一帧时也调），
-// 读到的操作先放进队列并马上响一声；processInput 每帧开头把队列里的请求发给 hub。
+// 读到的操作先放进队列并马上响一声；processInput 每帧开头把队列里的请求交给后台任务发给 hub。
 // 这样按得再快也不会漏，按下去立刻有反馈，不用等这一帧画面下载完。
-enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK };
+enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK, EV_WHIP };
 struct Ev {
     EvType type;
     int16_t x, y;
@@ -424,12 +466,79 @@ static void pushEv(EvType type, int x = 0, int y = 0) {
     evTail = next;
 }
 
+// 屏幕下方三个触摸键：手指要实实在在按住 BTN_PRESS_MS 才算（握机时蹭到、擦过去都不算），
+// 一个键触发后 BTN_COOLDOWN_MS 内不再触发（触摸屏抖一下变成连按两次）。
+static constexpr uint32_t BTN_PRESS_MS = 80;
+static constexpr uint32_t BTN_COOLDOWN_MS = 600;
+struct TouchKey {
+    bool fired = false;                       // 这次按住已经触发过了，松手前不再触发
+    uint32_t at = 0;                          // 上次触发的时间
+};
+static TouchKey keyA, keyB, keyC;
+
+static bool cooled(TouchKey &k) {
+    if (k.at && millis() - k.at < BTN_COOLDOWN_MS) return false;
+    k.at = millis();
+    return true;
+}
+
+// 按住满 BTN_PRESS_MS 就触发（不用等松手）
+static bool keyPressed(m5::Button_Class &b, TouchKey &k) {
+    if (!b.isPressed()) {
+        k.fired = false;
+        return false;
+    }
+    if (k.fired || !b.pressedFor(BTN_PRESS_MS)) return false;
+    k.fired = true;
+    return cooled(k);
+}
+
+// 点一下（按住至少 BTN_PRESS_MS、没到按住的时间就松手）：松手时触发
+static bool keyClicked(m5::Button_Class &b, TouchKey &k) {
+    return b.wasClicked() && b.wasReleaseFor(BTN_PRESS_MS) && cooled(k);
+}
+
+// 摇一摇：加速度超过 SHAKE_G 算「一下」（相隔至少 80ms，过了峰值回落才算下一下），
+// SHAKE_WINDOW_MS 内有 SHAKE_HITS 下才算在摇。碰一下、放到桌上、掉一下只有一两下，不会误触发。
+static constexpr uint32_t SHAKE_WINDOW_MS = 1200;
+static uint32_t shakeHits[8];
+static uint8_t shakeN = 0;                    // shakeHits 里记了几下（环形，最多 8 下）
+static bool shakeHigh = false;
+static uint32_t lastImuAt = 0;
+
+static void pollShake() {
+    if (!M5.Imu.isEnabled() || millis() - lastImuAt < 10) return;
+    lastImuAt = millis();
+    if (!M5.Imu.update()) return;
+    auto d = M5.Imu.getImuData();
+    float g = sqrtf(d.accel.x * d.accel.x + d.accel.y * d.accel.y + d.accel.z * d.accel.z);
+    uint32_t now = millis();
+    if (g < SHAKE_G - 0.5f) {                 // 回落了：可以算下一下
+        shakeHigh = false;
+        return;
+    }
+    if (g <= SHAKE_G || shakeHigh) return;
+    shakeHigh = true;
+    constexpr int need = SHAKE_HITS < 1 ? 1 : SHAKE_HITS > 8 ? 8 : SHAKE_HITS;
+    if (shakeN && now - shakeHits[(shakeN - 1) % 8] < 80) return;
+    shakeHits[shakeN % 8] = now;
+    shakeN++;
+    if (shakeN >= need && now - shakeHits[(shakeN - need) % 8] <= SHAKE_WINDOW_MS && now - lastShake > 3000) {
+        lastShake = now;
+        shakeN = 0;
+        whipFeedback();
+        pushEv(EV_WHIP);
+    }
+    if (shakeN >= 16) shakeN = 8 + shakeN % 8;   // 别溢出，保持下标对得上
+}
+
 static void pollInput() {
     M5.update();
-    if (M5.BtnA.wasPressed()) { click(); pushEv(EV_ENCOURAGE); }     // 左：一按下就算
-    if (M5.BtnB.wasPressed()) { click(); pushEv(EV_CHAT); }          // 中：一按下就算
-    if (M5.BtnC.wasClicked()) { click(); pushEv(EV_SKIN); }          // 右：点一下换肤（松手时才知道不是按住）
-    if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }         // 按住右键 2 秒：设置
+    if (keyPressed(M5.BtnA, keyA)) { click(); pushEv(EV_ENCOURAGE); }   // 左：按稳了就算
+    if (keyPressed(M5.BtnB, keyB)) { click(); pushEv(EV_CHAT); }        // 中：按稳了就算
+    if (keyClicked(M5.BtnC, keyC)) { click(); pushEv(EV_SKIN); }        // 右：点一下换肤（松手时才知道不是按住）
+    if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }            // 按住右键 2 秒：设置
+    pollShake();
 
     auto t = M5.Touch.getDetail();
     if (t.y >= M5.Display.height()) return;                          // 屏幕下方是三个触摸键，上面已经处理
@@ -459,8 +568,9 @@ static void processInput() {
             case EV_CHAT: sendButton("chat"); break;                     // hub：显示 / 隐藏聊天记录
             case EV_SKIN: sendButton("notify"); break;
             case EV_SETTINGS: wantSettings = true; return;
-            case EV_TAP: postHub("/api/poke", String("{\"x\":") + e.x + ",\"y\":" + e.y + "}"); break;
+            case EV_TAP: postAsync("/api/poke", String("{\"x\":") + e.x + ",\"y\":" + e.y + "}"); break;
             case EV_FLICK: sendButton("", e.y > 0 ? 30 : -30); break;    // 往下滑看更早的消息，往上滑回到最新
+            case EV_WHIP: sendButton("dial"); break;                     // 摇一摇 = 抽鞭子（hub 自己也有冷却）
             case EV_HOLD: {                                              // 按住：录音（hub 按位置决定私聊谁 / 发群里）
                 if (!M5.Touch.getDetail().isPressed()) break;            // 已经松手了
                 String reply;
@@ -472,15 +582,9 @@ static void processInput() {
         }
     }
 
-    // 摇一摇 = 抽鞭子（hub 自己有冷却，这里再限一下 3 秒）
-    if (M5.Imu.isEnabled() && M5.Imu.update()) {
-        auto d = M5.Imu.getImuData();
-        float g = sqrtf(d.accel.x * d.accel.x + d.accel.y * d.accel.y + d.accel.z * d.accel.z);
-        if (g > SHAKE_G && millis() - lastShake > 3000) {
-            lastShake = millis();
-            whipFeedback();
-            sendButton("dial");
-        }
+    if (hubErr) {
+        hubErr = false;
+        showNotice(hubErrCode == 401 ? String("Bad token") : "Hub error " + String(hubErrCode));
     }
 
     if (vibeOffAt && millis() > vibeOffAt) {
@@ -493,6 +597,8 @@ static void processInput() {
 static void openSettings(const char *reason) {
     wantSettings = false;
     netPause = true;                          // 扫描 WiFi、改地址时别让网络任务在旁边连 hub
+    if (reqQ) xQueueReset(reqQ);              // 没发的按键作废
+    for (uint32_t t0 = millis(); sending && millis() - t0 < 4000;) delay(10);   // 正在发的等它发完（设置会改 hub 地址）
     delay(100);
     if (settingsUI(canvas, reason)) {         // 保存了：用新设置重连
         WiFi.disconnect(true);
@@ -519,7 +625,7 @@ static void reportStats() {
     stAt = millis();
     stWaitMs = stRecvMs = stFetchN = 0;
     stApplyMs = stFrames = stBytes = stFull = 0;
-    postHub("/api/device_stats", body);
+    postAsync("/api/device_stats", body);
 }
 
 // ---------------------------------------------------------------- 主流程
@@ -536,9 +642,12 @@ void setup() {
     canvas.createSprite(320, 240);
     canvas.setFont(&fonts::efontCN_14);        // 提示文字有中文
     M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
+    for (auto *b : {&M5.BtnA, &M5.BtnB, &M5.BtnC}) b->setDebounceThresh(30);   // 触摸屏偶尔抖一下，别当成松手再按
 
     settingsLoad();
     xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);   // 下载画面放在 core 0
+    reqQ = xQueueCreate(8, sizeof(HubReq));
+    xTaskCreatePinnedToCore(sendTask, "send", 6144, nullptr, 1, nullptr, 0);  // 发按键也在 core 0
     drawStatus("牛马办公室", "启动中…");
     if (S.ssid.isEmpty() && savedNets.empty()) openSettings("先设置 WiFi");
     if (!connectWifi()) {

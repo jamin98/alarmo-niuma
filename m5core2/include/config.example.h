@@ -12,4 +12,5 @@
 #define JPEG_QUALITY   80     // 已不用：画面改成从 /frame.rle 取增量帧（留着兼容旧的 niuma_config.h）
 #define FRAME_MS       30     // 已不用：画面改成 hub 推流，帧率跟着 hub 的 [device] fps 走（留着兼容旧的 niuma_config.h）
 #define BRIGHTNESS     160    // 背光 0~255
-#define SHAKE_G        2.3f   // 摇一摇抽鞭子的灵敏度（加速度，单位 g），不想要就改成 99
+#define SHAKE_G        2.5f   // 摇一摇抽鞭子的灵敏度（加速度，单位 g）：越大越要用力摇，不想要就改成 99
+#define SHAKE_HITS     3      // 1.2 秒内要甩到 SHAKE_G 几下才算摇（1~8）：越大越不容易误触发
