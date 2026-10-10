@@ -14,6 +14,7 @@ import random
 import socket
 import struct
 import time
+import zlib
 from collections import OrderedDict
 try:
     import tomllib
@@ -599,7 +600,9 @@ class Hub:
         hub 自己记着推过去的最后一帧，下一条就以它为基准。每推一条都等 Core2 在 TCP 层把它全部确认收到，
         再算下一条：路上最多只有一帧，Core2 慢的时候中间的帧直接跳过，延迟不会越积越大。
         比每帧一问一答快：实测 Core2 收完一帧到发出下一个请求要 ~100ms（ESP32 HTTPClient 内部），推流没有这一步。
-        Core2 要整帧（刚连上、从设置回来）就断开重连：新连接第一条一定是整帧。"""
+        Core2 要整帧（刚连上、从设置回来）就断开重连：新连接第一条一定是整帧。
+        ?z=1：每条再用 deflate（raw，无 zlib 头）压一遍，抽鞭子这种大动画少传 2.4~3.3 倍，Core2 用 ROM 里的 tinfl 解。"""
+        deflate = request.query.get("z") == "1"
         resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
         resp.force_close()
         await resp.prepare(request)
@@ -623,6 +626,9 @@ class Hub:
                     await asyncio.sleep(0.005)
                 t_wait = time.time()
                 fid, body = self.frame_rle(base)
+                if deflate:
+                    z = zlib.compressobj(6, zlib.DEFLATED, -15)
+                    body = z.compress(body) + z.flush()
                 t_enc = time.time()
                 msg = struct.pack("<I", len(body)) + body
                 await resp.write(msg)
