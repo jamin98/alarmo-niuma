@@ -606,12 +606,6 @@ class Hub:
         tr = request.transport
         if tr is not None:
             tr.set_write_buffer_limits(high=1, low=0)               # 有没发出去的就等：帧不在 hub 里排队
-            sock = tr.get_extra_info("socket")
-            if sock is not None:
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024)   # 系统里也只留一两帧
-                except OSError:
-                    pass
         writer = resp._payload_writer
         sock = tr.get_extra_info("socket") if tr is not None else None
         await writer.drain()
