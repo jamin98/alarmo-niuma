@@ -183,7 +183,10 @@ static bool fetchInto(HTTPClient &http, WiFiClient &client, uint8_t *buf, int &l
     uint32_t t0 = millis();
     while (got < size && millis() - t0 < 3000) {
         int n = s->available();
-        if (n > 0) got += s->readBytes(buf + got, min(n, size - got));
+        if (n > 0) {                          // 批量读：readBytes 是一个字节一个字节地读，10KB 要一万次调用
+            int r = s->read(buf + got, min(n, size - got));
+            if (r > 0) got += r;
+        }
         else if (!s->connected()) break;
         else delay(1);
     }
