@@ -366,7 +366,7 @@ python bridge\bridge.py --voice-test 某个bot的完整名
 | 点一下屏幕上的某只牛马 | 点名 |
 | 按住某只牛马 / 按住「我」 | 用 Core2 自带的麦克风录音（右上角显示 REC），松手发送，最长 60 秒 |
 | 屏幕上下滑动 | 转滚轮：聊天记录 / 额度页 |
-| 摇一摇 | 抽鞭子（往群里发催进度的话），带振动和「啪」的一声 |
+| 摇一摇 | 抽鞭子（往群里发催进度的话），带振动和「啪」的一声；要来回甩几下才算 |
 
 发送类操作有冷却（`[buttons] cooldown`，默认 3 秒）；桥接离线时屏幕提示「桥接离线，没发出去」，失败会提示原因。
 
@@ -471,7 +471,7 @@ Grok Bot 的额度由 Cursor 后端提供，桥接每隔几分钟调两个**只�
 
 **`bridge/secrets.toml`**：`cursor_session`，cursor.com 的登录 Cookie（额度和云端任务要用）。
 
-**Core2**：WiFi、hub 地址、口令在 Core2 屏幕上设置（按住右键 2 秒），存在 Core2 里；`m5core2/include/niuma_config.h`（可选，不进 git）只放出厂默认值和 `JPEG_QUALITY`、`FRAME_MS`、`BRIGHTNESS`、`SHAKE_G`（见 [m5core2/README.md](m5core2/README.md)）。
+**Core2**：WiFi、hub 地址、口令在 Core2 屏幕上设置（按住右键 2 秒），存在 Core2 里；`m5core2/include/niuma_config.h`（可选，不进 git）只放出厂默认值和 `JPEG_QUALITY`、`FRAME_MS`、`BRIGHTNESS`、`SHAKE_G`、`SHAKE_HITS`（见 [m5core2/README.md](m5core2/README.md)）。
 
 ## 命令行与接口
 
@@ -491,7 +491,7 @@ python bridge.py --voice-test [完整名] [--wav 文件] # 测按住说话：让
 |---|---|
 | `GET /` | 网页模拟器 |
 | `GET /stream.mjpg` · `/frame.jpg?q=80&after=帧号` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（响应头 `X-Frame-Id` 是帧号，带 `after` 时等到有新帧才返回）/ 单帧 PNG |
-| `GET /frame.stream` | Core2 用的增量帧推流（HTTP/1.0，响应一直不结束）：每条 `<长度 u32>` + 增量帧，只含和上一条相比变了的 40×40 小块（RGB565 + 行程压缩），第一条是整帧；每条都等对方 TCP 确认收到再推下一条，不积压 |
+| `GET /frame.stream` | Core2 用的增量帧推流（HTTP/1.0，响应一直不结束）：每条 `<长度 u32>` + 增量帧，只含和上一条相比变了的 16×16 小块（RGB565 + 行程压缩），第一条是整帧；每条都等对方 TCP 确认收到再推下一条，不积压 |
 | `GET /frame.rle?after=帧号&base=帧号` | 同样的增量帧，一问一答的版本：只发和 `base` 那一帧相比变了的部分；`base=0` 发整帧 |
 | `POST /api/device_stats` | Core2 每 3 秒报一次性能统计（固件版本、帧率、等帧 / 收数据 / 画图耗时、每帧大小、WiFi 信号），出现在 `/api/state` 的 `core2` 里；hub 自己这边推帧的统计在 `frame_rle` 里 |
 | `GET /api/state` | 当前状态（bot、公告、录音、额度、主题等） |

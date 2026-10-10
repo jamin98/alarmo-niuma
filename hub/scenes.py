@@ -707,26 +707,21 @@ class Theme:
                 d.text((bx, by), "啪!!", font=self.huge, fill=WHITE if int(now * 20) % 2 else YELLOW, anchor="mm")
 
     def shake(self, office, now):
+        """挨抽那一下整屏抖几抖。整屏一挪每个小块都变了，Core2 那边每帧都得整屏重传，所以只抖 0.3 秒。"""
         tw = now - office.whip_t0
-        k = int(now * 40)
-        if T_WHIP_HIT <= tw < T_WHIP_HIT + 0.45:
+        k = int(now * 20)
+        if T_WHIP_HIT <= tw < T_WHIP_HIT + 0.3:
             return (k * 7 % 11) - 5, (k * 11 % 11) - 5
-        if T_WHIP_JUMP <= tw < T_WHIP_HIT + 2.0:
-            return (k * 7 % 5) - 2, (k * 11 % 3) - 1
         return 0, 0
 
     def rush_banner(self, d, office, now):
-        """惊慌阶段：顶上一条红黄警示带，写"全员冲刺"，同时屏幕边缘一闪一闪。"""
+        """惊慌阶段：顶上一条红黄警示带，写"全员冲刺"，屏幕边缘一圈红框。
+        红框不闪：一闪整圈边上的小块都跟着变，Core2 每帧要重传大半个屏幕，动画就卡了。"""
         tw = now - office.whip_t0
         if not T_WHIP_HIT + 0.25 <= tw < T_WHIP_END - 0.6:
             return
-        fade = min(1.0, (T_WHIP_END - 0.6 - tw) / 0.5)
-        if int(now * 6) % 2 == 0:
-            col = tuple(int(v * fade) for v in RED)
-            for k in range(3):
-                d.rectangle([k, k, W - 1 - k, H - 1 - k], outline=col)
-        if fade < 1.0:
-            return
+        for k in range(3):
+            d.rectangle([k, k, W - 1 - k, H - 1 - k], outline=RED)
         d.rectangle([0, 0, W, 15], (30, 20, 20))
         for x in range(-16 + int(now * 40) % 16, W, 16):
             d.polygon([(x, 15), (x + 8, 15), (x + 16, 0), (x + 8, 0)], YELLOW)
@@ -737,7 +732,7 @@ class Theme:
 
     def stall_frame(self, d, office, now):
         if office.stalled(now):
-            a = 0.5 + 0.5 * math.sin(now * 5)
+            a = int(now * 1.5) % 2                                    # 亮暗两档慢慢闪：每帧都变的话 Core2 每帧都要重传四条边
             col = tuple(int(RED[j] * (0.45 + 0.55 * a)) for j in range(3))
             for k in range(3):
                 d.rectangle([k, k, W - 1 - k, H - 1 - k], outline=col)
