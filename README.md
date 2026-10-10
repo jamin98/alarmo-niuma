@@ -491,8 +491,9 @@ python bridge.py --voice-test [完整名] [--wav 文件] # 测按住说话：让
 |---|---|
 | `GET /` | 网页模拟器 |
 | `GET /stream.mjpg` · `/frame.jpg?q=80&after=帧号` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（响应头 `X-Frame-Id` 是帧号，带 `after` 时等到有新帧才返回）/ 单帧 PNG |
-| `GET /frame.rle?after=帧号&base=帧号` | Core2 用的增量帧：只发和 `base` 那一帧相比变了的 40×40 小块（RGB565 + 行程压缩）；`base=0` 发整帧 |
-| `POST /api/device_stats` | Core2 每 3 秒报一次性能统计（帧率、下载 / 画图耗时、每帧大小、WiFi 信号），出现在 `/api/state` 的 `core2` 里 |
+| `GET /frame.stream` | Core2 用的增量帧推流（HTTP/1.0，响应一直不结束）：每条 `<长度 u32>` + 增量帧，只含和上一条相比变了的 40×40 小块（RGB565 + 行程压缩），第一条是整帧；每条都等对方 TCP 确认收到再推下一条，不积压 |
+| `GET /frame.rle?after=帧号&base=帧号` | 同样的增量帧，一问一答的版本：只发和 `base` 那一帧相比变了的部分；`base=0` 发整帧 |
+| `POST /api/device_stats` | Core2 每 3 秒报一次性能统计（固件版本、帧率、等帧 / 收数据 / 画图耗时、每帧大小、WiFi 信号），出现在 `/api/state` 的 `core2` 里；hub 自己这边推帧的统计在 `frame_rle` 里 |
 | `GET /api/state` | 当前状态（bot、公告、录音、额度、主题等） |
 | `POST /api/button` | `{"button": "dial" \| "back" \| "notify" \| "chat"}`（`chat` = 显示 / 隐藏聊天内容）或 `{"dial": 30}` |
 | `POST /api/poke` | 点名：`{"x": .., "y": ..}`（屏幕坐标）或 `{"name": "短名"}` |

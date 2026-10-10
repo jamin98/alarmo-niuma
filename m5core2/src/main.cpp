@@ -1,8 +1,8 @@
 // 牛马办公室 - M5Stack Core2 屏幕端
 //
 // Core2 的屏幕正好是 320x240，和 hub 渲染的画面一样大。这里不做任何绘制，只做三件事：
-//   1. 连 WiFi，从 hub 取 /frame.rle 并显示：只传和上一帧相比变了的 40x40 小块（RGB565 + 行程压缩），
-//      不用解 JPEG、没变的地方不重画；下载在 core 0 的网络任务里，画图在 core 1，两边同时干；
+//   1. 连 WiFi，连上 hub 的 /frame.stream 一直收画面：hub 有新帧就推一条增量帧——只含和上一帧相比变了的
+//      40x40 小块（RGB565 + 行程压缩），不用解 JPEG、没变的地方不重画；收数据在 core 0 的网络任务里，画图在 core 1；
 //   2. 把按键、滑动、摇一摇变成 hub 的 /api/button 请求；
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
@@ -30,6 +30,7 @@
 #include "settings.h"
 
 static constexpr size_t FRAME_MAX = 256 * 1024;   // 一帧最坏情况（每个像素都和旁边不一样）约 230KB
+static constexpr const char *FW_VERSION = "2026.10.10-stream";   // 报给 hub，排查时确认烧的是哪一版
 
 static M5Canvas canvas(&M5.Display);          // 屏幕上这一帧的完整副本：叠提示、恢复画面都靠它
 
@@ -48,7 +49,7 @@ static bool noticeOnScreen = false;
 static volatile uint32_t netFails = 0;
 static uint32_t lastFrameAt = 0;
 // 性能统计（每 3 秒报给 hub）
-static volatile uint32_t stFetchMs = 0, stFetchN = 0;
+static volatile uint32_t stWaitMs = 0, stRecvMs = 0, stFetchN = 0;
 static uint32_t stApplyMs = 0, stFrames = 0, stBytes = 0, stFull = 0, stAt = 0;
 static uint32_t noticeUntil = 0;
 static String notice;
@@ -162,78 +163,121 @@ static bool connectWifi(uint32_t timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------- 取画面（core 0 上的网络任务）
-// /frame.rle?after=<帧号>&base=<屏幕上的帧号>：hub 有了新的一帧才返回（最多等 1 秒），只发和 base 比变了的部分。
-static bool fetchInto(HTTPClient &http, WiFiClient &client, uint8_t *buf, int &len, uint32_t base, uint32_t &id) {
-    static const char *hdrs[] = {"X-Frame-Id"};
-    http.setReuse(true);                      // 一直复用同一个连接，省掉每帧握手
-    http.setConnectTimeout(1500);
-    http.setTimeout(3000);
-    String url = S.hub + "/frame.rle?after=" + String(id) + "&base=" + String(base);
-    if (!http.begin(client, url)) return false;
-    http.collectHeaders(hdrs, 1);
-    int code = http.GET();
-    int size = http.getSize();
-    if (code != 200 || size <= 11 || (size_t)size > FRAME_MAX) {
-        http.end();
-        return false;
-    }
-    uint32_t newId = http.header("X-Frame-Id").toInt();
-    WiFiClient *s = http.getStreamPtr();
-    int got = 0;
+// 连 hub 的 /frame.stream（HTTP/1.0，响应一直不结束），然后一条一条读：<长度 u32> + NRLE 增量帧。
+// hub 每推一条都等这边在 TCP 层确认收到才推下一条，所以路上最多一帧。要整帧时断开重连（新连接第一条是整帧）。
+// 以前是每帧发一次 HTTP 请求：实测 ESP32 的 HTTPClient 收完一帧到发出下一个请求要 ~100ms，帧率卡在 9~10。
+static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+static uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+static bool parseHub(String &host, uint16_t &port) {
+    String u = S.hub;
+    if (u.startsWith("http://")) u = u.substring(7);
+    int slash = u.indexOf('/');
+    if (slash >= 0) u = u.substring(0, slash);
+    int colon = u.lastIndexOf(':');
+    host = colon > 0 ? u.substring(0, colon) : u;
+    port = colon > 0 ? u.substring(colon + 1).toInt() : 80;
+    return host.length() && port;
+}
+
+// 读满 n 个字节；连接断了或 timeoutMs 内一个字节都没来就返回 false
+static bool readFull(WiFiClient &c, uint8_t *buf, size_t n, uint32_t timeoutMs) {
+    size_t got = 0;
     uint32_t t0 = millis();
-    while (got < size && millis() - t0 < 3000) {
-        int n = s->available();
-        if (n > 0) {                          // 批量读：readBytes 是一个字节一个字节地读，10KB 要一万次调用
-            int r = s->read(buf + got, min(n, size - got));
-            if (r > 0) got += r;
+    while (got < n) {
+        int a = c.available();
+        if (a > 0) {
+            int r = c.read(buf + got, min((size_t)a, n - got));
+            if (r > 0) {
+                got += r;
+                t0 = millis();
+            }
+        } else if (!c.connected() || millis() - t0 > timeoutMs) {
+            return false;
+        } else {
+            delay(1);
         }
-        else if (!s->connected()) break;
-        else delay(1);
     }
-    http.end();
-    if (got != size) return false;
-    len = size;
-    id = newId;
     return true;
 }
 
+static bool openStream(WiFiClient &c) {
+    String host;
+    uint16_t port;
+    c.stop();
+    if (!parseHub(host, port) || !c.connect(host.c_str(), port, 2000)) return false;
+    c.setNoDelay(true);
+    c.print("GET /frame.stream HTTP/1.0\r\nHost: " + host + "\r\n\r\n");
+    String line;                              // 读响应头，读到空行为止；第一行要是 200
+    bool ok = false;
+    int lines = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 3000) {
+        if (!c.available()) {
+            if (!c.connected()) return false;
+            delay(1);
+            continue;
+        }
+        char ch = c.read();
+        if (ch == '\r') continue;
+        if (ch != '\n') {
+            if (line.length() < 200) line += ch;
+            continue;
+        }
+        if (lines++ == 0) ok = line.indexOf(" 200") > 0;
+        else if (line.isEmpty()) return ok;
+        line = "";
+    }
+    return false;
+}
+
 static void netTask(void *) {
-    WiFiClient client;
-    HTTPClient http;
-    uint32_t id = 0;                          // 最后交给主循环的帧号 = 主循环画完后屏幕上的帧
+    WiFiClient c;
+    bool open = false;
     for (;;) {
         if (netPause || WiFi.status() != WL_CONNECTED) {
+            if (open) c.stop();
+            open = false;
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        if (needKeyframe) {                   // 要整帧：断开重连，新连接的第一条一定是整帧
+            needKeyframe = false;
+            if (open) c.stop();
+            open = false;
+        }
+        if (!open) {
+            open = openStream(c);
+            if (!open) {
+                netFails = netFails + 1;
+                vTaskDelay(pdMS_TO_TICKS(netFails > 3 ? 500 : 200));
+                continue;
+            }
+        }
         if (midFresh) {                       // 主循环还没取走上一帧：等它（增量帧不能跳）
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        uint32_t base = id;
-        if (needKeyframe) {
-            needKeyframe = false;
-            base = 0;
-        }
+        uint8_t hdr[4];
         uint32_t t0 = millis();
-        int len = 0;
-        uint32_t newId = id;
-        if (fetchInto(http, client, fbuf[backBuf], len, base, newId)) {
-            stFetchMs = stFetchMs + (millis() - t0);
-            stFetchN = stFetchN + 1;
-            netFails = 0;
-            id = newId;
-            portENTER_CRITICAL(&frameMux);
-            fbufLen[backBuf] = len;
-            std::swap(backBuf, midBuf);
-            midFresh = true;
-            portEXIT_CRITICAL(&frameMux);
-        } else {
+        bool ok = readFull(c, hdr, 4, 3000);  // hub 每帧都推（画面没变时只有十几个字节），3 秒没动静就是断了
+        uint32_t t1 = millis(), n = ok ? rd32(hdr) : 0;
+        ok = ok && n >= 11 && n <= FRAME_MAX && readFull(c, fbuf[backBuf], n, 3000);
+        if (!ok) {
+            c.stop();
+            open = false;
             netFails = netFails + 1;
-            vTaskDelay(pdMS_TO_TICKS(netFails > 3 ? 500 : 100));
+            continue;
         }
-        uint32_t used = millis() - t0;
-        if (used < FRAME_MS) vTaskDelay(pdMS_TO_TICKS(FRAME_MS - used));
+        stWaitMs = stWaitMs + (t1 - t0);
+        stRecvMs = stRecvMs + (millis() - t1);
+        stFetchN = stFetchN + 1;
+        netFails = 0;
+        portENTER_CRITICAL(&frameMux);
+        fbufLen[backBuf] = n;
+        std::swap(backBuf, midBuf);
+        midFresh = true;
+        portEXIT_CRITICAL(&frameMux);
     }
 }
 
@@ -253,9 +297,6 @@ static bool takeFrame() {
 // 画一帧：b"NRLE" <帧号 u32><整帧 u8><矩形数 u16>，每个矩形 <x y w h u16><字节数 u32> + 行程数据
 // （每段 3 字节：个数-1、RGB565 低字节、高字节；逐行）。每个矩形先解到内存里，再写进 canvas 和屏幕。
 static uint16_t tileBuf[320 * 40];
-
-static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 
 static bool applyFrame(const uint8_t *b, int len, bool toLcd) {
     if (len < 11 || memcmp(b, "NRLE", 4) != 0) return false;
@@ -468,14 +509,15 @@ static void openSettings(const char *reason) {
 static void reportStats() {
     if (millis() - stAt < 3000) return;
     float sec = (millis() - stAt) / 1000.0f;
-    String body = String("{\"fps\":") + String(stFrames / sec, 1) +
-                  ",\"fetch_ms\":" + (stFetchN ? stFetchMs / stFetchN : 0) +
+    String body = String("{\"ver\":\"") + FW_VERSION + "\",\"fps\":" + String(stFrames / sec, 1) +
+                  ",\"wait_ms\":" + (stFetchN ? stWaitMs / stFetchN : 0) +
+                  ",\"recv_ms\":" + (stFetchN ? stRecvMs / stFetchN : 0) +
                   ",\"draw_ms\":" + (stFrames ? stApplyMs / stFrames : 0) +
                   ",\"kb_per_frame\":" + (stFrames ? stBytes / stFrames / 1024 : 0) +
                   ",\"full_frames\":" + stFull + ",\"rssi\":" + WiFi.RSSI() +
                   ",\"free_heap\":" + ESP.getFreeHeap() + "}";
     stAt = millis();
-    stFetchMs = stFetchN = 0;
+    stWaitMs = stRecvMs = stFetchN = 0;
     stApplyMs = stFrames = stBytes = stFull = 0;
     postHub("/api/device_stats", body);
 }

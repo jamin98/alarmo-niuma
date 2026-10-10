@@ -1,6 +1,6 @@
 # M5Stack Core2 屏幕端
 
-Core2（含 v1.1 / v1.3，BMI270 或 MPU6886 都行）的屏幕正好是 320×240，和 hub 渲染的画面一样大。固件只做几件事：连 WiFi 从 hub 取 `/frame.rle` 显示——只传和上一帧相比变了的 40×40 小块（RGB565 + 行程压缩，平均每帧几 KB 到二十几 KB），不用解 JPEG、没变的地方不重画，下载在 core 0、画图在 core 1 同时进行；把按键、触摸、滑动、摇一摇、录音变成 hub 的请求；用振动和扬声器给抽鞭子加反馈。**不需要 USB 串口协议，也不需要 Alarmo 的 AES key。**
+Core2（含 v1.1 / v1.3，BMI270 或 MPU6886 都行）的屏幕正好是 320×240，和 hub 渲染的画面一样大。固件只做几件事：连 WiFi 后连上 hub 的 `/frame.stream` 一直收画面——hub 有新帧就推一条增量帧，只含和上一帧相比变了的 40×40 小块（RGB565 + 行程压缩，平均每帧几 KB 到二十几 KB），不用解 JPEG、没变的地方不重画；收数据在 core 0、画图在 core 1 同时进行，hub 每推一帧都等 Core2 收下再推下一帧，所以不会积压延迟；把按键、触摸、滑动、摇一摇、录音变成 hub 的请求；用振动和扬声器给抽鞭子加反馈。**不需要 USB 串口协议，也不需要 Alarmo 的 AES key。**
 
 | 操作 | 作用 |
 |---|---|
@@ -48,7 +48,7 @@ pio device monitor               # 看日志（可选）
 
 ## 调参
 
-在 `include/niuma_config.h`（没有就复制 `config.example.h`）：`FRAME_MS`（两次取图的最小间隔，默认 30 毫秒；hub 有新帧才返回，实际帧率跟着 hub 的 `[device] fps` 走）、`BRIGHTNESS`（背光）、`SHAKE_G`（摇一摇灵敏度，不想要就写 99）。这几项改了要重新编译。
+在 `include/niuma_config.h`（没有就复制 `config.example.h`）：`BRIGHTNESS`（背光）、`SHAKE_G`（摇一摇灵敏度，不想要就写 99）。这几项改了要重新编译。
 
 ## 排错
 
@@ -57,4 +57,4 @@ pio device monitor               # 看日志（可选）
 | 「连接 WiFi…」一直转 | WiFi 名或密码不对，或者是 5 GHz 网络；点屏幕进设置重新选 |
 | 「hub 连不上」 | hub 没运行 / hub 地址不对 / 防火墙拦了 8765 / 不在同一网段；点屏幕进设置改地址 |
 | 画面正常，但按键后提示 `Bad token` | hub 口令和 `hub/config.toml` 的 `token` 不一致；按住右键 2 秒进设置改 |
-| 帧率低 | 先确认 hub 的 `[device] fps` 是 20。Core2 每 3 秒把帧率、下载耗时、画图耗时、每帧大小、WiFi 信号报给 hub，打开 `http://<hub>:8765/api/state` 看 `core2` 那一项就知道卡在哪：`fetch_ms` 大是网络慢（WiFi 信号 `rssi` 低于 -75 就算差），`draw_ms` 大是画图慢；`neon` 主题每帧变化最多 |
+| 帧率低 | 先确认 hub 的 `[device] fps` 是 20。Core2 每 3 秒把帧率、下载耗时、画图耗时、每帧大小、WiFi 信号报给 hub，打开 `http://<hub>:8765/api/state` 看 `core2` 那一项就知道卡在哪：`ver` 是固件版本，`wait_ms` 是等 hub 推下一帧，`recv_ms` 是收一帧的数据（大说明 WiFi 慢，信号 `rssi` 低于 -75 就算差），`draw_ms` 是画一帧；`neon` 主题每帧变化最多 |

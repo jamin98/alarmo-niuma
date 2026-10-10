@@ -7,9 +7,11 @@
 """
 import argparse
 import asyncio
+import sys
 import io
 import itertools
 import random
+import socket
 import struct
 import time
 from collections import OrderedDict
@@ -75,6 +77,7 @@ class Hub:
         self._jpg = (None, None, b"")
         self.rgb565 = OrderedDict()        # 最近几十帧的 RGB565 画面 {帧号: (240, 320) uint16}，算增量用
         self.device_stats = {}             # Core2 上报的性能统计
+        self.rle_log = []                  # 最近 100 次 /frame.rle 请求的计时（排查卡顿用）
         self.demo = demo
         self.link = None
         self.loop = None
@@ -571,12 +574,83 @@ class Hub:
             base = int(request.query.get("base", "0"))
         except ValueError:
             after, base = -1, 0
-        end = time.time() + 1.0
+        t_in = time.time()
+        end = t_in + 1.0
         while self.frame_id == after and time.time() < end:
             await asyncio.sleep(0.005)
+        t_wait = time.time()
         fid, body = self.frame_rle(base)
-        return web.Response(body=body, content_type="application/octet-stream",
+        t_out = time.time()
+        # 排查卡顿用：记下每次取帧在 hub 上花的时间、和上一次回复之间隔了多久、是不是新连接
+        peer = request.transport.get_extra_info("peername") if request.transport else None
+        log = self.rle_log
+        prev = log[-1] if log else None
+        log.append({"in": t_in, "out": t_out, "wait": t_wait - t_in, "enc": t_out - t_wait, "bytes": len(body),
+                    "gap": (t_in - prev["out"]) if prev else 0.0, "port": peer[1] if peer else 0,
+                    "skipped": max(0, fid - after - 1) if after >= 0 else 0})
+        if len(log) > 100:
+            del log[0]
+        resp = web.Response(body=body, content_type="application/octet-stream",
                             headers={"Cache-Control": "no-store", "X-Frame-Id": str(fid)})
+        return resp
+
+    async def h_frame_stream(self, request):
+        """Core2 取画面（推流版）：一个连接一直开着，hub 有新帧就推一条 <长度 u32> + NRLE 增量帧。
+        hub 自己记着推过去的最后一帧，下一条就以它为基准。每推一条都等 Core2 在 TCP 层把它全部确认收到，
+        再算下一条：路上最多只有一帧，Core2 慢的时候中间的帧直接跳过，延迟不会越积越大。
+        比每帧一问一答快：实测 Core2 收完一帧到发出下一个请求要 ~100ms（ESP32 HTTPClient 内部），推流没有这一步。
+        Core2 要整帧（刚连上、从设置回来）就断开重连：新连接第一条一定是整帧。"""
+        resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream", "Cache-Control": "no-store"})
+        resp.force_close()
+        await resp.prepare(request)
+        tr = request.transport
+        if tr is not None:
+            tr.set_write_buffer_limits(high=1, low=0)               # 有没发出去的就等：帧不在 hub 里排队
+            sock = tr.get_extra_info("socket")
+            if sock is not None:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024)   # 系统里也只留一两帧
+                except OSError:
+                    pass
+        writer = resp._payload_writer
+        sock = tr.get_extra_info("socket") if tr is not None else None
+        await writer.drain()
+        for _ in range(250):                              # 先等响应头被对方确认，再开始记账
+            ti = tcp_info(sock) if sock is not None else None
+            if ti is None or ti.BytesInFlight == 0:
+                break
+            await asyncio.sleep(0.002)
+        acks = AckTracker(sock)
+        base = last = 0
+        try:
+            while True:
+                t_in = time.time()
+                while self.frame_id == last:
+                    await asyncio.sleep(0.005)
+                t_wait = time.time()
+                fid, body = self.frame_rle(base)
+                t_enc = time.time()
+                msg = struct.pack("<I", len(body)) + body
+                await resp.write(msg)
+                await writer.drain()                                    # aiohttp 默认攒满 64KB 才等，这里每条都等
+                acks.wrote(len(msg))
+                end = time.time() + 2.0
+                while time.time() < end:                                # 等 Core2 把这一帧全部确认收到
+                    if not acks.pending():                              # 0 = 收完了；None = 系统不支持，不等
+                        break
+                    await asyncio.sleep(0.002)
+                t_out = time.time()
+                prev = self.rle_log[-1] if self.rle_log else None
+                self.rle_log.append({"in": t_in, "out": t_out, "wait": t_wait - t_in, "enc": t_enc - t_wait,
+                                     "send": t_out - t_enc, "bytes": len(body), "gap": 0.0,
+                                     "port": tr.get_extra_info("peername")[1] if tr else 0,
+                                     "skipped": max(0, fid - last - 1) if last else 0})
+                if len(self.rle_log) > 100:
+                    del self.rle_log[0]
+                base = last = fid
+        except (ConnectionResetError, ConnectionAbortedError, asyncio.CancelledError, RuntimeError):
+            pass
+        return resp
 
     async def h_device_stats(self, request):
         """Core2 每几秒报一次性能统计（帧率、各环节耗时），出现在 /api/state 的 core2 里，方便远程排查卡顿。"""
@@ -625,6 +699,13 @@ class Hub:
         snap["theme"] = self.theme
         snap["https_port"] = self.https_port
         snap["core2"] = self.device_stats
+        log = [e for e in self.rle_log if time.time() - e["out"] < 10]
+        if log:
+            avg = lambda k: round(sum(e[k] for e in log) / len(log) * 1000, 1)
+            snap["frame_rle"] = {"frames_10s": len(log), "hub_wait_ms": avg("wait"), "hub_encode_ms": avg("enc"),
+                                 "hub_send_ms": round(sum(e.get("send", 0) for e in log) / len(log) * 1000, 1),
+                                 "gap_ms": avg("gap"), "avg_bytes": sum(e["bytes"] for e in log) // len(log),
+                                 "new_connections": len({e["port"] for e in log}), "skipped_frames": sum(e["skipped"] for e in log)}
         return web.json_response(snap)
 
     async def h_index(self, request):
@@ -644,6 +725,7 @@ class Hub:
             web.get("/frame.png", self.h_frame),
             web.get("/frame.jpg", self.h_frame_jpg),
             web.get("/frame.rle", self.h_frame_rle),
+            web.get("/frame.stream", self.h_frame_stream),
             web.post("/api/device_stats", self.h_device_stats),
             web.get("/stream.mjpg", self.h_stream),
             web.get("/api/state", self.h_state),
@@ -754,6 +836,64 @@ def ssl_context(folder, s):
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(str(crt), str(key))
     return ctx
+
+
+def tcp_info(sock):
+    """Windows：一个 TCP 连接的内部状态（已发未确认字节、RTT、对方窗口…），拿不到返回 None。排查卡顿用。"""
+    if sys.platform != "win32" or sock is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class TCP_INFO_v0(ctypes.Structure):
+        _fields_ = [("State", ctypes.c_int), ("Mss", wintypes.ULONG), ("ConnectionTimeMs", ctypes.c_uint64),
+                    ("TimestampsEnabled", ctypes.c_ubyte), ("RttUs", wintypes.ULONG), ("MinRttUs", wintypes.ULONG),
+                    ("BytesInFlight", wintypes.ULONG), ("Cwnd", wintypes.ULONG), ("SndWnd", wintypes.ULONG),
+                    ("RcvWnd", wintypes.ULONG), ("RcvBuf", wintypes.ULONG), ("BytesOut", ctypes.c_uint64),
+                    ("BytesIn", ctypes.c_uint64), ("BytesReordered", wintypes.ULONG), ("BytesRetrans", wintypes.ULONG),
+                    ("FastRetrans", wintypes.ULONG), ("DupAcksIn", wintypes.ULONG), ("TimeoutEpisodes", wintypes.ULONG),
+                    ("SynRetrans", ctypes.c_ubyte)]
+    ver, info, ret = wintypes.DWORD(0), TCP_INFO_v0(), wintypes.DWORD(0)
+    ws = ctypes.windll.ws2_32
+    ws.WSAIoctl.argtypes = [ctypes.c_size_t, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p, ctypes.c_void_p]
+    if ws.WSAIoctl(sock.fileno(), 0xD8000027, ctypes.byref(ver), 4, ctypes.byref(info), ctypes.sizeof(info),
+                   ctypes.byref(ret), None, None) != 0:
+        return None
+    return info
+
+
+class AckTracker:
+    """这条连接上，hub 写出去的字节里还有多少对方没确认（包括还卡在系统发送缓冲里没发出去的）。
+    Windows：SIO_TCP_INFO 的 BytesInFlight 只算已经发上网线的，所以改用"对方已确认的总字节 ≈ 发出 - 在路上"
+    （重传不扣：就算 BytesOut 里含重传，也只是偶尔早一点推下一帧，不会卡住），
+    和 hub 自己写出去的总字节比；Linux：TIOCOUTQ 本来就是"没发 + 没确认"。都拿不到时 pending() 返回 None。"""
+
+    def __init__(self, sock):
+        self.sock, self.written, self.base = sock, 0, None
+        if sys.platform == "win32":
+            ti = tcp_info(sock)
+            if ti is not None:                            # 从这里开始算（响应头已经写出去了）
+                self.base = ti.BytesOut - ti.BytesInFlight
+
+    def wrote(self, n):
+        self.written += n
+
+    def pending(self):
+        if self.sock is None:
+            return None
+        if sys.platform == "win32":
+            ti = tcp_info(self.sock)
+            if ti is None or self.base is None:
+                return None
+            acked = ti.BytesOut - ti.BytesInFlight - self.base
+            return max(0, self.written - acked)
+        try:
+            import fcntl
+            import termios
+            return struct.unpack("i", fcntl.ioctl(self.sock.fileno(), termios.TIOCOUTQ, b"\0\0\0\0"))[0]
+        except (OSError, ImportError, AttributeError):
+            return None
 
 
 def wav_seconds(wav):
