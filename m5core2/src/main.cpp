@@ -6,7 +6,7 @@
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
 // 操作：
-//   屏幕下方三个触摸键   左 = 一键鼓励    中 = 抽鞭子（大按钮）    右 = 换肤
+//   屏幕下方三个触摸键   左 = 一键鼓励    中 = 显示 / 隐藏聊天记录（在聊天记录页里 = 回到工位）    右 = 换肤
 //   在屏幕上上下滑动      转滚轮：进入聊天记录并翻页（按「中」回到工位）
 //   点一下屏幕上的某只牛马  点名：老板跑过去盯着它，并私聊它一句（hub 的 [buttons] poke_text）
 //   按住某只牛马 / 按住「我」 说话私聊它 / 发到群里：用 Core2 自带的麦克风录，松手把录音传给 hub，
@@ -36,6 +36,7 @@ static String notice;
 static uint32_t vibeOffAt = 0;
 static uint32_t lastShake = 0;
 static bool wantSettings = false;             // 要进设置界面（按住右键，或在连不上的画面上点了屏幕）
+static void pollInput();                      // 取画面时也要读输入，定义在后面
 
 // ---------------------------------------------------------------- 小工具
 static void showNotice(const String &s, uint32_t ms = 2000) {
@@ -129,6 +130,7 @@ static bool fetchFrame() {
         } else if (!s->connected()) {
             break;
         } else {
+            pollInput();
             delay(1);
         }
     }
@@ -204,52 +206,76 @@ static void recordVoice() {
     free(buf);
 }
 
-// 往 hub 发按键。button = "dial" | "back" | "notify"；dial != 0 时发滚轮转动（度）。
+// 往 hub 发按键。button = "dial" | "back" | "notify" | "chat"；dial != 0 时发滚轮转动（度）。
 static bool sendButton(const char *button, int dial = 0) {
     String body = dial ? String("{\"dial\":") + dial + "}" : String("{\"button\":\"") + button + "\"}";
     return postHub("/api/button", body);
 }
 
 // ---------------------------------------------------------------- 输入
-static void handleInput() {
+// 读输入（pollInput）和发请求（processInput）分开：pollInput 每几毫秒调一次（取画面、等下一帧时也调），
+// 读到的操作先放进队列并马上响一声；processInput 每帧开头把队列里的请求发给 hub。
+// 这样按得再快也不会漏，按下去立刻有反馈，不用等这一帧画面下载完。
+enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK };
+struct Ev {
+    EvType type;
+    int16_t x, y;
+};
+static Ev evq[16];
+static uint8_t evHead = 0, evTail = 0;
+
+static void pushEv(EvType type, int x = 0, int y = 0) {
+    uint8_t next = (evTail + 1) % 16;
+    if (next == evHead) return;               // 满了就丢（不太可能）
+    evq[evTail] = {type, (int16_t)x, (int16_t)y};
+    evTail = next;
+}
+
+static void pollInput() {
     M5.update();
+    if (M5.BtnA.wasPressed()) { click(); pushEv(EV_ENCOURAGE); }     // 左：一按下就算
+    if (M5.BtnB.wasPressed()) { click(); pushEv(EV_CHAT); }          // 中：一按下就算
+    if (M5.BtnC.wasClicked()) { click(); pushEv(EV_SKIN); }          // 右：点一下换肤（松手时才知道不是按住）
+    if (M5.BtnC.wasHold()) { click(); pushEv(EV_SETTINGS); }         // 按住右键 2 秒：设置
 
-    if (M5.BtnA.wasClicked()) {               // 左：一键鼓励
-        click();
-        sendButton("back");
-    }
-    if (M5.BtnB.wasClicked()) {               // 中：抽鞭子
-        whipFeedback();
-        sendButton("dial");
-    }
-    if (M5.BtnC.wasClicked()) {               // 右：换肤
-        click();
-        sendButton("notify");
-    }
-    if (M5.BtnC.wasHold()) {                  // 按住右键：设置
-        click();
-        wantSettings = true;
-        return;
-    }
-
-    // 屏幕上滑动 = 转滚轮。往下滑看更早的消息，往上滑回到最新
     auto t = M5.Touch.getDetail();
-    if (t.wasHold() && t.y < M5.Display.height()) {        // 按住：录音（hub 按位置决定私聊谁 / 发群里），松手发送
-        click();
-        String reply;
-        if (postHub("/api/voice", String("{\"action\":\"start\",\"x\":") + t.x + ",\"y\":" + t.y + "}", &reply)
-            && reply.indexOf("\"ok\": true") >= 0) recordVoice();      // 没按中牛马或「我」时 ok 是 false
-        return;
-    }
-    if (t.wasClicked() && t.y < M5.Display.height()) {     // 点一下：hub 按当前主题找点中的牛马，点名盯它
-        click();
-        postHub("/api/poke", String("{\"x\":") + t.x + ",\"y\":" + t.y + "}");
-    }
-    if (t.wasFlicked() && t.y < M5.Display.height()) {
+    if (t.y >= M5.Display.height()) return;                          // 屏幕下方是三个触摸键，上面已经处理
+    if (t.wasHold()) { click(); pushEv(EV_HOLD, t.x, t.y); }
+    else if (t.wasClicked()) { click(); pushEv(EV_TAP, t.x, t.y); }
+    else if (t.wasFlicked()) {
         int dy = t.distanceY();
-        if (abs(dy) > 25 && abs(dy) > abs(t.distanceX())) {
-            click();
-            sendButton("", dy > 0 ? 30 : -30);
+        if (abs(dy) > 25 && abs(dy) > abs(t.distanceX())) { click(); pushEv(EV_FLICK, 0, dy); }
+    }
+}
+
+// 等 ms 毫秒，期间一直读输入
+static void pollFor(uint32_t ms) {
+    uint32_t t0 = millis();
+    do {
+        pollInput();
+        delay(5);
+    } while (millis() - t0 < ms);
+}
+
+static void processInput() {
+    while (evHead != evTail) {
+        Ev e = evq[evHead];
+        evHead = (evHead + 1) % 16;
+        switch (e.type) {
+            case EV_ENCOURAGE: sendButton("back"); break;
+            case EV_CHAT: sendButton("chat"); break;                     // hub：显示 / 隐藏聊天记录
+            case EV_SKIN: sendButton("notify"); break;
+            case EV_SETTINGS: wantSettings = true; return;
+            case EV_TAP: postHub("/api/poke", String("{\"x\":") + e.x + ",\"y\":" + e.y + "}"); break;
+            case EV_FLICK: sendButton("", e.y > 0 ? 30 : -30); break;    // 往下滑看更早的消息，往上滑回到最新
+            case EV_HOLD: {                                              // 按住：录音（hub 按位置决定私聊谁 / 发群里）
+                if (!M5.Touch.getDetail().isPressed()) break;            // 已经松手了
+                String reply;
+                if (postHub("/api/voice", String("{\"action\":\"start\",\"x\":") + e.x + ",\"y\":" + e.y + "}", &reply)
+                    && reply.indexOf("\"ok\": true") >= 0) recordVoice();  // 没按中牛马或「我」时 ok 是 false
+                evHead = evTail;                                         // 录音期间的操作作废
+                return;
+            }
         }
     }
 
@@ -312,7 +338,8 @@ void loop() {
         openSettings(WiFi.status() == WL_CONNECTED ? nullptr : "WiFi 连不上");
         return;
     }
-    handleInput();
+    pollInput();
+    processInput();
     if (wantSettings) return;
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -339,5 +366,5 @@ void loop() {
     }
 
     uint32_t used = millis() - t0;
-    if (used < FRAME_MS) delay(FRAME_MS - used);
+    pollFor(used < FRAME_MS ? FRAME_MS - used : 1);       // 等下一帧的时候也一直读输入
 }

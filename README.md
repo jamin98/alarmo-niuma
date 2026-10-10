@@ -361,12 +361,12 @@ python bridge\bridge.py --voice-test 某个bot的完整名
 
 | 操作 | 作用 |
 |---|---|
-| 屏幕下方左 / 中 / 右触摸键 | 发大饼 / 抽鞭子（在聊天记录里是回到工位）/ 换肤 |
+| 屏幕下方左 / 中 / 右触摸键 | 发大饼 / 显示或隐藏聊天记录（在聊天记录页里是回到工位）/ 换肤 |
 | 按住右键 2 秒 | 设置：选 WiFi、输密码、改 hub 地址和口令（存在 Core2 里，不用重新编译） |
 | 点一下屏幕上的某只牛马 | 点名 |
 | 按住某只牛马 / 按住「我」 | 用 Core2 自带的麦克风录音（右上角显示 REC），松手发送，最长 60 秒 |
 | 屏幕上下滑动 | 转滚轮：聊天记录 / 额度页 |
-| 摇一摇 | 抽鞭子，带振动和「啪」的一声 |
+| 摇一摇 | 抽鞭子（往群里发催进度的话），带振动和「啪」的一声 |
 
 发送类操作有冷却（`[buttons] cooldown`，默认 3 秒）；桥接离线时屏幕提示「桥接离线，没发出去」，失败会提示原因。
 
@@ -492,7 +492,7 @@ python bridge.py --voice-test [完整名] [--wav 文件] # 测按住说话：让
 | `GET /` | 网页模拟器 |
 | `GET /stream.mjpg` · `/frame.jpg?q=80` · `/frame.png` | 画面：MJPEG 推流 / 单帧 JPEG（Core2 用，响应头 `X-Frame-Id`）/ 单帧 PNG |
 | `GET /api/state` | 当前状态（bot、公告、录音、额度、主题等） |
-| `POST /api/button` | `{"button": "dial" \| "back" \| "notify"}` 或 `{"dial": 30}` |
+| `POST /api/button` | `{"button": "dial" \| "back" \| "notify" \| "chat"}`（`chat` = 显示 / 隐藏聊天内容）或 `{"dial": 30}` |
 | `POST /api/poke` | 点名：`{"x": .., "y": ..}`（屏幕坐标）或 `{"name": "短名"}` |
 | `POST /api/voice` · `/api/voice/clip` | 按住说话：`{"action": "start", "x", "y"}` / `{"action": "cancel"}`；松手后 POST WAV |
 | `POST /api/theme` · `/api/options` | 换主题 `{"theme": "meeting"}`、显示选项 `{"show_chat": true}` |

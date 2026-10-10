@@ -123,6 +123,13 @@ class Hub:
             of.view = "office"
             of.say("皮肤: " + THEME_NAMES[nxt], "ok", now)
             return
+        if button == "chat":                # Core2 中键：显示 / 隐藏聊天内容；在聊天记录 / 额度页里是回到工位
+            if of.view != "office":
+                of.view = "office"
+                return
+            of.show_chat = not of.show_chat
+            of.say("显示聊天记录" if of.show_chat else "隐藏聊天记录", "ok", now)
+            return
         if button == "back":                # 左上：一键鼓励 —— 老板挨个走到每个人面前发大饼，同时往群里发一句
             if of.tour_at(now):
                 of.say("老板正在发饼", "warn", now)
