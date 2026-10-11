@@ -162,15 +162,22 @@ class Hub:
         self.send_text(self.buttons.get("dial_text", ""), now)
 
     def question_tap(self, hit, now=None):
-        """点了提问卡片或公告栏上的「待确认」：打开卡片 / 关掉 / 选一个选项（让桥接在 Grok Bot 里替你点）。"""
+        """点了提问卡片或公告栏上的「待确认」：打开卡片 / 稍后再弹 / 选一个选项（让桥接在 Grok Bot 里替你点）。
+        卡片没确认前一直挂在屏幕上，点卡片外面不关（stay）。"""
         now = now or time.time()
         of = self.office
         if hit[0] == "open":
             of.question_open = hit[1]
+            of.question_snooze.pop(hit[1], None)
             return {"ok": True, "question": "open"}
+        if hit[0] == "stay":
+            return {"ok": True, "question": "stay"}
         if hit[0] == "close":
+            q = of.shown_question(now)
+            if q is not None:
+                of.snooze_question(q.qid, now)
             of.question_open = ""
-            return {"ok": True, "question": "close"}
+            return {"ok": True, "question": "later"}
         q, k = of.question(hit[1]), hit[2]
         if q is None or q.state != "pending" or not 0 <= k < len(q.options):
             return {"ok": False, "error": "这个问题已经处理了"}
@@ -190,8 +197,11 @@ class Hub:
                 if q2 is not None and q2.state == "sending":
                     q2.state = "pending"
                 of.say("没提交上: " + error[:14], "err")
-        self.queue({"type": "answer", "qid": q.qid, "bot": self.full_name(q.bot) if q.bot else "",
-                    "title": q.title, "option": q.options[k], "index": k}, now, cb=done, extra=10.0)
+        cmd = {"type": "answer", "qid": q.qid, "bot": self.full_name(q.bot) if q.bot else "",
+               "title": q.title, "option": q.options[k], "index": k}
+        if q.chat is not None:
+            cmd["chat"] = q.chat                                    # 桥接报来的聊天标题原样带回去
+        self.queue(cmd, now, cb=done, extra=10.0)
         of.say("提交中…", "warn", now)
         return {"ok": True, "question": "sending"}
 
@@ -422,10 +432,11 @@ class Hub:
             of.set_remote(str(ev["name"]), str(ev.get("state", "")), now)
         elif t == "note":
             of.set_note(str(ev["name"]), str(ev.get("text", "")))
-        elif t == "question":                # 提问卡片：{"id", "name", "title", "options": [...], "recommended": 下标, "answer"?}
+        elif t == "question":                # 提问卡片：{"id", "name", "chat"?, "title", "detail"?, "options": [...], "recommended": 下标, "answer"?}
             qid = str(ev["id"])
             of.set_question(qid, str(ev.get("name", "")), str(ev.get("title", "")),
-                            list(ev.get("options", [])), int(ev.get("recommended", -1)), now)
+                            list(ev.get("options", [])), int(ev.get("recommended", -1)), now,
+                            detail=str(ev.get("detail", "")), chat=None if ev.get("chat") is None else str(ev["chat"]))
             if ev.get("answer"):             # 卡片上已经显示选了哪个（你在电脑上直接点的）
                 of.answer_question(qid, str(ev["answer"]), now)
         elif t == "question_gone":           # 卡片不见了：{"id", "answer"?}
@@ -525,7 +536,7 @@ class Hub:
             return web.json_response({"ok": False, "error": "不在工位画面"})
         x, y = float(body.get("x", -1)), float(body.get("y", -1))
         theme = self.painter()
-        if of.question_open or theme.question_hit(of, x, y) is not None:
+        if of.shown_question() is not None or theme.question_hit(of, x, y) is not None:
             return web.json_response({"ok": False, "error": "提问卡片上不能录音"})   # 按住选项别变成录音
         i = theme.bot_at(of, x, y)
         if i < 0 and not theme.me_at(of, x, y):
