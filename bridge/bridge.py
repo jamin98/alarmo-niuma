@@ -296,6 +296,10 @@ def parse_question(texts, buttons, selected=()):
         return None
     texts = [" ".join(str(t).split()) for t in texts if str(t).strip() and " ".join(str(t).split()) not in seen]
     title = next((t for t in texts if t.endswith(("？", "?"))), "") or max(texts, key=len, default="")
+    # sand-message-card 不只是提问卡片（云端任务卡片「main 运行中 / 停止… / 打开…」也是）：
+    # 要么带「忽略问题」按钮，要么有一句问话，才算问你
+    if not title.endswith(("？", "?")) and not any(" ".join(str(b).split()) == "忽略问题" for b in buttons):
+        return None
     detail = " ".join(t for t in texts if t != title)[:200]          # 问题下面那行说明
     rec, options = -1, []
     for k, b in enumerate(raw):
@@ -1029,6 +1033,54 @@ class GrokWindow:
             except Exception:
                 pass
 
+    def _exe_path(self):
+        """Grok Bot.exe 在哪：正在跑就从它的窗口进程读；没在跑用 config 的 grok_exe，再不行用默认安装位置。"""
+        import ctypes
+        import os
+        win = self.find()
+        if win is not None:
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, win.ProcessId)             # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                try:
+                    buf, n = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+                    if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                        self.exe = buf.value
+                finally:
+                    k.CloseHandle(h)
+        return (getattr(self, "exe", "") or self.cfg.get("grok_exe")
+                or os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Grok Bot", "Grok Bot.exe"))
+
+    def restart(self, timeout=40.0):
+        """重启 Grok Bot：把 Grok Bot.exe 的进程全杀掉（托盘、执行子进程一起），重新打开，等窗口出来放到前台。"""
+        import os
+        import subprocess
+        exe = self._exe_path()
+        if not os.path.isfile(exe):
+            raise RuntimeError(f"找不到 {exe}，在 config.toml 里填 grok_exe")
+        name = os.path.basename(exe)
+        flags = 0x08000000                                              # CREATE_NO_WINDOW
+        subprocess.run(["taskkill", "/F", "/T", "/IM", name], capture_output=True, creationflags=flags)
+        end = time.time() + 10
+        while time.time() < end:                                        # 等进程都退干净，不然新开的会被单实例锁挡回去
+            out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"], capture_output=True,
+                                 creationflags=flags).stdout.decode("mbcs", "replace")
+            if name.lower() not in out.lower():
+                break
+            time.sleep(0.5)
+        self.win = None
+        os.startfile(exe)                                               # 和双击一样打开，不挂在桥接进程下面
+        end = time.time() + timeout
+        while time.time() < end:
+            time.sleep(1.0)
+            win = self.find()
+            if win is not None and self.heading():                      # 界面加载出来了（有聊天标题）
+                break
+        else:
+            raise RuntimeError("重开了但等不到窗口")
+        if not self._to_front(win.NativeWindowHandle):
+            raise RuntimeError("重开了，但窗口切不到前台(锁屏?)")
+
     def _go_back(self, back, target):
         if back and not self._same_chat(back, target):
             time.sleep(0.4)
@@ -1205,10 +1257,14 @@ def main():
             if args.dry_run:
                 time.sleep(poll)
             for c in cmds:
-                if c.get("type") not in ("send", "send_private", "voice_play", "answer"):
+                if c.get("type") not in ("send", "send_private", "voice_play", "answer", "restart_grok"):
                     continue
                 try:
-                    if c["type"] == "answer":                 # 你在屏幕上选了提问卡片的某个选项
+                    if c["type"] == "restart_grok":           # 你在 Core2 上按住了左键（发饼）
+                        print("重启 Grok Bot…")
+                        gw.restart()
+                        print("Grok Bot 已重启，放到了前台")
+                    elif c["type"] == "answer":                 # 你在屏幕上选了提问卡片的某个选项
                         gw.answer(c["qid"], int(c["index"]), c["option"], c.get("bot", ""), c.get("chat"))
                         print(f"已替你选：{c['option']}（{c.get('title', '')}）")
                     elif c["type"] == "voice_play":
@@ -1299,10 +1355,14 @@ def main():
                 if r:
                     who, text, ts = r
                     messages.append((me if who in humans else who, text, ts))
+            backlog = title != last_title or last_hello == now     # 启动 / 换了聊天 / hub 可能重启过
             if last_title is not None and title != last_title:
                 tracker.rebase(messages)              # 换了个聊天：里面已有的记录不当新消息
             last_title = title
             events = tracker.update(statuses, messages, private=not is_group)
+            if backlog and messages:                  # 已有的记录也报一份给 hub，只用来补挂「@你要你回话」的卡片
+                events.append({"type": "backlog", "private": not is_group,
+                               "messages": [[w, t[:500]] for w, t, _ts in messages[-40:]]})
             # 云端任务：只有"云端 bot 自己的聊天"打开时才看得到它的任务行；看到就上报，看不到不乱清零
             owner = cfg.get("cloud_owner", "")
             rows_a = parse_agent_rows(snap.get("agents", []))

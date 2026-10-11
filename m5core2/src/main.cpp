@@ -7,6 +7,7 @@
 //   3. 用振动马达和扬声器给「抽鞭子」加点反馈。
 //
 // 操作：
+//   按住左键 2 秒          重启跑 Grok Bot 那台电脑上的 Grok Bot.exe（全杀掉再打开），放到前台
 //   屏幕下方三个触摸键   左 = 一键鼓励    中 = 显示 / 隐藏聊天记录（在聊天记录页里 = 回到工位）    右 = 换肤
 //   按住中键              按住期间看历史聊天记录（可以同时在屏幕上滑动翻页），松手回到工位
 //   在屏幕上上下滑动     转滚轮：进入聊天记录并翻页（按「中」回到工位）
@@ -37,7 +38,7 @@
 #endif
 
 static constexpr size_t FRAME_MAX = 256 * 1024;   // 一帧最坏情况（每个像素都和旁边不一样）约 230KB
-static constexpr const char *FW_VERSION = "2026.10.10-slownet";   // 报给 hub，排查时确认烧的是哪一版
+static constexpr const char *FW_VERSION = "2026.10.12-restart";   // 报给 hub，排查时确认烧的是哪一版
 
 static M5Canvas canvas(&M5.Display);          // 屏幕上这一帧的完整副本：叠提示、恢复画面都靠它
 
@@ -498,7 +499,7 @@ static void recordVoice() {
     free(buf);
 }
 
-// 往 hub 发按键。button = "dial" | "back" | "notify" | "chat" | "chat_hold" | "chat_release"；dial != 0 时发滚轮转动（度）。
+// 往 hub 发按键。button = "dial" | "back" | "restart_grok" | "notify" | "chat" | "chat_hold" | "chat_release"；dial != 0 时发滚轮转动（度）。
 static void sendButton(int kind, const char *button, int dial = 0, bool keep = false) {
     String body = dial ? String("{\"dial\":") + dial + "}" : String("{\"button\":\"") + button + "\"}";
     postAsync("/api/button", body, kind, keep);
@@ -508,7 +509,7 @@ static void sendButton(int kind, const char *button, int dial = 0, bool keep = f
 // 读输入（pollInput）和发请求（processInput）分开：pollInput 每几毫秒调一次（取画面、等下一帧时也调），
 // 读到的操作先放进队列并马上响一声；processInput 每帧开头把队列里的请求交给后台任务发给 hub。
 // 这样按得再快也不会漏，按下去立刻有反馈，不用等这一帧画面下载完。
-enum EvType : uint8_t { EV_ENCOURAGE, EV_CHAT, EV_HISTORY, EV_HISTORY_END, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK, EV_WHIP };
+enum EvType : uint8_t { EV_RESTART_GROK, EV_ENCOURAGE, EV_CHAT, EV_HISTORY, EV_HISTORY_END, EV_SKIN, EV_SETTINGS, EV_HOLD, EV_TAP, EV_FLICK, EV_WHIP };
 struct Ev {
     EvType type;
     int16_t x, y;
@@ -559,7 +560,8 @@ static void pollShake() {
 
 static void pollInput() {
     M5.update();
-    if (M5.BtnA.wasPressed()) { click(); pushEv(EV_ENCOURAGE); }     // 左：一按下就算
+    if (M5.BtnA.wasClicked()) { click(); pushEv(EV_ENCOURAGE); }     // 左：点一下（松手就发）= 发饼
+    if (M5.BtnA.wasHold()) { click(); pushEv(EV_RESTART_GROK); }     // 按住左键 2 秒：重启 Grok Bot
     // 中：点一下切换聊天内容（要分「点一下」和「按住」，所以松手时才触发）；按住 = 看历史聊天记录，松手回到工位
     static bool historyHeld = false;
     if (M5.BtnB.wasClicked()) { click(); pushEv(EV_CHAT); }
@@ -602,6 +604,7 @@ static void processInput() {
         if (stillSending(e.type)) continue;
         switch (e.type) {
             case EV_ENCOURAGE: sendButton(e.type, "back"); break;
+            case EV_RESTART_GROK: sendButton(e.type, "restart_grok"); break;   // hub -> 桥接：重启 Grok Bot.exe
             case EV_CHAT: sendButton(e.type, "chat"); break;             // hub：显示 / 隐藏聊天记录
             case EV_HISTORY: sendButton(-1, "chat_hold"); break;         // hub：打开聊天记录页（和松开成对，不拦）
             case EV_HISTORY_END: sendButton(-1, "chat_release", 0, true); break;   // hub：回到工位（再晚也要发）
@@ -690,6 +693,7 @@ void setup() {
     canvas.setPsram(true);
     canvas.createSprite(320, 240);
     canvas.setFont(&fonts::efontCN_14);        // 提示文字有中文
+    M5.BtnA.setHoldThresh(2000);              // 左键：点一下发饼，按住 2 秒重启 Grok Bot
     M5.BtnB.setHoldThresh(400);               // 中键：点一下切换聊天内容，按住 0.4 秒看历史聊天记录
     M5.BtnC.setHoldThresh(2000);              // 右键：点一下换肤，按住 2 秒进设置
 

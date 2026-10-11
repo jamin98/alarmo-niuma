@@ -55,7 +55,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:12px}
 
 <div class="stage"><div class="alarmo">
   <div class="top">
-    <button class="cap" id="bBack" title="一键鼓励：往群里发一句夸奖 (E)">鼓励</button>
+    <button class="cap" id="bBack" title="一键鼓励：往群里发一句夸奖 (E)；按住 2 秒：重启 Grok Bot">鼓励</button>
     <div class="dial" id="dial" title="按下：抽鞭子 (空格)　拖动/滚轮：转动"><div class="ridges" id="ridges"></div><div class="lab">抽 鞭 子</div></div>
     <button class="cap" id="bNotify" title="换肤：切换下一个主题 (T)">换肤</button>
   </div>
@@ -109,7 +109,17 @@ const up = () => { if(!drag) return; dial.classList.remove('down'); if(!drag.mov
 dial.addEventListener('pointerup', up); dial.addEventListener('pointercancel', () => {dial.classList.remove('down'); drag=null;});
 dial.addEventListener('wheel', e => { e.preventDefault(); rotate(e.deltaY > 0 ? 30 : -30); }, {passive:false});
 
-$('bBack').onclick = () => { btn('back'); toast('一键鼓励'); };
+// 鼓励键：点一下 = 一键鼓励；按住 2 秒 = 重启 Grok Bot.exe 并放到前台（和 Core2 左键一样）
+let backHold = null;
+$('bBack').addEventListener('pointerdown', e => {
+  $('bBack').setPointerCapture(e.pointerId);
+  backHold = setTimeout(() => { backHold = 'fired'; btn('restart_grok'); toast('重启 Grok Bot'); }, 2000);
+});
+$('bBack').addEventListener('pointerup', () => {
+  if (backHold && backHold !== 'fired') { clearTimeout(backHold); btn('back'); toast('一键鼓励'); }
+  backHold = null;
+});
+$('bBack').addEventListener('pointercancel', () => { if (backHold !== 'fired') clearTimeout(backHold); backHold = null; });
 $('bNotify').onclick = () => { btn('notify'); toast('换肤'); };
 
 const flash = el => { el.classList.add('down'); setTimeout(() => el.classList.remove('down'), 120); };
