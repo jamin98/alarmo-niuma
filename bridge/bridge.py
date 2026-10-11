@@ -272,17 +272,19 @@ def parse_row(row_name, anchor_name, chips):
 # ---------------------------------------------------------------- 提问卡片（bot 问你、给几个选项让你选）
 # 卡片外层控件的 ClassName 里含这些字就当提问卡片（不分大小写）。Grok Bot 改版对不上时，在 config.toml 的
 # question_class 里改：卡片显示在屏幕上时跑 python bridge.py --probe，在 uia_dump.txt 里找卡片那一层的 class
-QUESTION_CLASS = ("question", "ask-user", "askuser", "ask_user")
-QUESTION_SKIP = {"提交", "确认", "确定", "跳过", "取消", "关闭", "其他", "其它", "自定义", "发送", "复制",
+# Grok Bot 0.68.1 实测：卡片外层是 sand-message-card（里面问题、说明两行字，选项是按钮，右上角一个「忽略问题」）
+QUESTION_CLASS = ("sand-message-card", "question", "ask-user", "askuser", "ask_user")
+QUESTION_SKIP = {"提交", "确认", "确定", "跳过", "取消", "关闭", "其他", "其它", "自定义", "发送", "复制", "忽略问题", "忽略",
                  "Submit", "Confirm", "Skip", "Cancel", "Close", "Other", "Send", "Copy"}
 QUESTION_SUBMIT = ("提交", "确认", "确定", "发送", "Submit", "Confirm", "Send")
+ENTRY_RE = re.compile(r"(?:%40|@|s)(\d+)-timestamp$")    # 聊天记录每一行的序号（行里时间戳控件 id 的末尾）
 OPTION_LETTER_RE = re.compile(r"^\s*([A-Fa-f])\s*[.、:：)）]\s*")
 REC_WORD_RE = re.compile(r"[（(]?\s*(?:建议|推荐|Recommended)\s*[)）]?\s*[：:]?\s*")
 REC_LETTER_RE = re.compile(r"(?:建议|推荐|Recommended)\s*(?:选)?\s*([A-Fa-f])(?![A-Za-z])")
 
 
 def parse_question(texts, buttons, selected=()):
-    """一张提问卡片里的文字和按钮 -> {"qid", "title", "options": [显示用], "raw": [按钮原名], "recommended", "answer"}；
+    """一张提问卡片里的文字和按钮 -> {"qid", "title", "detail", "options": [显示用], "raw": [按钮原名], "recommended", "answer"}；
     不像提问（选项少于 2 个）返回 None。"""
     raw, seen = [], set()
     for b in buttons:
@@ -294,6 +296,7 @@ def parse_question(texts, buttons, selected=()):
         return None
     texts = [" ".join(str(t).split()) for t in texts if str(t).strip() and " ".join(str(t).split()) not in seen]
     title = next((t for t in texts if t.endswith(("？", "?"))), "") or max(texts, key=len, default="")
+    detail = " ".join(t for t in texts if t != title)[:200]          # 问题下面那行说明
     rec, options = -1, []
     for k, b in enumerate(raw):
         label = OPTION_LETTER_RE.sub("", b)
@@ -307,7 +310,8 @@ def parse_question(texts, buttons, selected=()):
             rec = ord(m.group(1).upper()) - 65
     answer = next((options[raw.index(s)] for s in selected if s in raw), "")
     qid = hashlib.sha1((title + "\n" + "\n".join(raw)).encode("utf-8")).hexdigest()[:12]
-    return {"qid": qid, "title": title, "options": options, "raw": raw, "recommended": rec, "answer": answer}
+    return {"qid": qid, "title": title, "detail": detail, "options": options, "raw": raw, "recommended": rec,
+            "answer": answer}
 
 
 def members_from_title(title, humans):
@@ -510,6 +514,7 @@ class GrokWindow:
         if win is None:
             return None
         title, sidebar, rows, seen_input, agent_names, cards = "", [], [], False, [], []
+        entries, row_ctx = [], None           # row_ctx = 刚走过的聊天行 (rect, 行名, 正文, chips, 序号)，卡片在它里面就是它发的
         for c in self._walk(win):
             try:
                 cls, ctype = c.ClassName or "", c.ControlTypeName
@@ -532,36 +537,49 @@ class GrokWindow:
             elif ctype == "ButtonControl" and (c.Name or "").startswith("在 ") and "中打开 " in (c.Name or ""):
                 agent_names.append(c.Name)
             elif ctype == "GroupControl" and "sand-transcript-row" in cls:
-                anchor, chips = "", []
+                anchor, chips, entry = "", [], None
                 for d in self._walk(c, 0, 12):
                     dc = d.ClassName or ""
                     if "sand-message-action-anchor" in dc and not anchor:
                         anchor = d.Name or ""
                     elif "sand-inserted-chip" in dc:
                         chips.append(d.Name or "")
+                    elif "sand-row-timestamp" in dc and entry is None:
+                        m = ENTRY_RE.search(d.AutomationId or "")
+                        entry = int(m.group(1)) if m else None
                 rows.append((c.Name or "", anchor, chips))
+                if entry is not None:
+                    entries.append(entry)
+                try:
+                    r = c.BoundingRectangle
+                    row_ctx = ((r.left, r.top, r.right, r.bottom), c.Name or "", anchor, chips, entry)
+                except Exception:
+                    row_ctx = None
             elif self.qclass and ctype in ("GroupControl", "CustomControl", "PaneControl", "ListControl") \
                     and any(f in cls.lower() for f in self.qclass):
-                cards.append(c)
+                cards.append((c, row_ctx))
         if not title and not sidebar:
             return None                       # 最小化时 Chromium 不生成无障碍树
-        return {"title": title, "sidebar": sidebar, "rows": rows, "agents": agent_names,
-                "questions": [q for q, _ in self._read_cards(cards)]}
+        done = []
+        return {"title": title, "sidebar": sidebar, "rows": rows, "agents": agent_names, "entries": entries,
+                "questions": [q for q, _ in self._read_cards(cards, done)], "done_cards": done}
 
     _OPTION_TYPES = ("ButtonControl", "RadioButtonControl", "ListItemControl", "CheckBoxControl")
 
-    def _read_cards(self, cards):
-        """提问卡片控件 -> [(parse_question 的结果, 卡片控件)]。卡片里面套着的小块（选项列表之类）也会被匹配上，
-        只留最外层；同一张卡片只留一次。"""
+    def _read_cards(self, cards, done=None):
+        """[(提问卡片控件, 它所在的聊天行 row_ctx 或 None)] -> [(parse_question 的结果, 卡片控件)]。
+        结果里另加 who（哪个 bot 发的，认不出是空）和 entry（卡片在第几行聊天记录，认不出是 None）。
+        卡片里面套着的小块（选项列表之类）也会被匹配上，只留最外层；同一张卡片只留一次。
+        已经选掉的卡片（Grok 把选项按钮收起来，只留问题和选中的那一行字）把里面的字放进 done。"""
         rects = []
-        for c in cards:
+        for c, _ctx in cards:
             try:
                 r = c.BoundingRectangle
                 rects.append((r.left, r.top, r.right, r.bottom))
             except Exception:
                 rects.append(None)
         out, seen = [], set()
-        for k, c in enumerate(cards):
+        for k, (c, ctx) in enumerate(cards):
             rk = rects[k]
             if rk is None or any(j != k and rj and rj != rk and rj[0] <= rk[0] and rj[1] <= rk[1]
                                  and rj[2] >= rk[2] and rj[3] >= rk[3] for j, rj in enumerate(rects)):
@@ -581,7 +599,13 @@ class GrokWindow:
                     if self._is_selected(d):
                         selected.append(" ".join(name.split()))
             q = parse_question(texts, buttons, selected)
+            if q is None and done is not None and texts:
+                done.append([" ".join(t.split()) for t in texts])
             if q and q["qid"] not in seen:
+                q["who"], q["entry"] = "", None
+                if ctx and ctx[0][0] <= rk[0] and ctx[0][1] <= rk[1] and ctx[0][2] >= rk[2] and ctx[0][3] >= rk[3]:
+                    r = parse_row(ctx[1], ctx[2] or q["title"], ctx[3])
+                    q["who"], q["entry"] = (r[0] if r else ""), ctx[4]
                 seen.add(q["qid"])
                 out.append((q, c))
         return out
@@ -602,34 +626,73 @@ class GrokWindow:
             pass
         return False
 
-    def question_cards(self):
-        """现在界面上的提问卡片 [(解析结果, 卡片控件)]。"""
-        win = self.find()
-        if win is None:
+    def question_cards(self, root=None):
+        """现在界面上（root 下面）的提问卡片 [(解析结果, 卡片控件)]。"""
+        root = root or self.find()
+        if root is None:
             return []
         cards = []
-        for c in self._walk(win):
+        for c in self._walk(root):
             try:
                 if c.ControlTypeName in ("GroupControl", "CustomControl", "PaneControl", "ListControl") \
                         and any(f in (c.ClassName or "").lower() for f in self.qclass):
-                    cards.append(c)
+                    cards.append((c, None))
             except Exception:
                 continue
         return self._read_cards(cards)
 
-    def answer(self, qid, index, option, bot=""):
-        """替你在提问卡片上选第 index 个选项（必要时再点「提交」）。卡片不在当前聊天里就先切到 bot 的单聊找。"""
-        found = next(((q, c) for q, c in self.question_cards() if q["qid"] == qid), None)
-        back = ""
-        if found is None and bot:
-            back = self.heading()
-            if self.open_chat(bot, keys=False):               # 只点侧边栏，不抢前台
-                found = next(((q, c) for q, c in self.question_cards() if q["qid"] == qid), None)
+    def _card(self, qid, root=None):
+        return next(((q, c) for q, c in self.question_cards(root) if q["qid"] == qid), None)
+
+    def _scroll_find(self, qid, pages=40):
+        """卡片被新消息顶上去了（对话记录只渲染看得见的一段）：一页页往上翻着找。
+        返回 (找到的卡片或 None, 翻回原位的函数)。"""
+        vp = self._find(name="对话记录", timeout=0.5)
+        try:
+            p = vp.GetPattern(self.auto.PatternId.ScrollPattern) if vp is not None else None
+        except Exception:
+            p = None
+        if not p:
+            return None, lambda: None
+        start = p.VerticalScrollPercent
+        back = lambda: p.SetScrollPercent(-1, 100 if start >= 99 else start, waitTime=0.2)
+        try:
+            for _ in range(pages):
+                if p.VerticalScrollPercent <= 0:
+                    break
+                p.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.LargeDecrement, waitTime=0.35)
+                found = self._card(qid, vp)
+                if found is not None:
+                    return found, back
+        except Exception:
+            pass
+        back()
+        return None, lambda: None
+
+    def answer(self, qid, index, option, bot="", chat=None):
+        """替你在提问卡片上选第 index 个选项（必要时再点「提交」）。卡片不在眼前就先切到它所在的聊天
+        （chat：空 = 群聊，否则是单聊名；老 hub 不给 chat 时按 bot 的单聊找），还没有就往上翻着找。"""
+        found = self._card(qid)
+        target = bot if chat is None else (chat or self.group_title)
+        back, unscroll = "", lambda: None
+        if found is None and target:
+            here = self.heading()
+            if not self._same_chat(here, target):
+                back = here
+                if self.open_chat(target, keys=False):        # 只点侧边栏，不抢前台
+                    found = self._card(qid)
+            if found is None and self._same_chat(self.heading(), target):
+                found, unscroll = self._scroll_find(qid)
         try:
             self._answer_card(found, index, option)
         finally:
+            try:
+                time.sleep(0.3)
+                unscroll()                                    # 翻上去找的：翻回原来的位置
+            except Exception:
+                pass
             if back:
-                self._go_back(back, bot)
+                self._go_back(back, target)
 
     def _answer_card(self, found, index, option):
         if found is None:
@@ -1117,7 +1180,7 @@ def main():
     last_title = None
     last_members = None
     last_notes = {}
-    last_questions = {}                     # 报过的提问卡片 {qid: (在哪个聊天看到的, 内容)}
+    last_questions = {}                     # 报过的提问卡片 {qid: [在哪个聊天看到的, 内容签名, 第几行, 上报的事件]}
     last_remote = (None, 0.0)
     colors, last_color_scan, sent_colors = {}, 0.0, None
     usage_box, usage_next = {}, 0.0
@@ -1146,7 +1209,7 @@ def main():
                     continue
                 try:
                     if c["type"] == "answer":                 # 你在屏幕上选了提问卡片的某个选项
-                        gw.answer(c["qid"], int(c["index"]), c["option"], c.get("bot", ""))
+                        gw.answer(c["qid"], int(c["index"]), c["option"], c.get("bot", ""), c.get("chat"))
                         print(f"已替你选：{c['option']}（{c.get('title', '')}）")
                     elif c["type"] == "voice_play":
                         gw.voice_play(c.get("to"), hub.clip(c["clip"]))
@@ -1224,7 +1287,8 @@ def main():
                                  "bots": [{"name": n, "color": use[n]} if n in use else n for n in bots]}])
                 tracker.statuses.clear()          # hub 可能重启过，状态重新报一遍
                 last_notes.clear()
-                last_questions.clear()            # 提问卡片也重新报一遍
+                for lq in last_questions.values():  # 提问卡片也重新报一遍（滚出去看不见的也报，hub 可能重启过）
+                    lq[1] = None
                 last_bots, last_hello = bots, now
 
             side = parse_sidebar(snap["sidebar"])
@@ -1256,19 +1320,34 @@ def main():
                     if previews.get(n) != t and not t.startswith(("你 ", "你:", "你：")):
                         events.append({"type": "message", "sender": n, "text": t[:500], "private": True})
             previews = pv
-            # 提问卡片：新出现的 / 选项或已选的变了就报；同一个聊天里卡片不见了报 gone（切到别的聊天看不到不算）
+            # 提问卡片：新出现的 / 选项或已选的变了就报；同一个聊天里卡片不见了报 gone。
+            # 切到别的聊天看不到不算；被新消息顶上去、滚出渲染范围的也不算（还等着你选）——卡片那一行
+            # 还在渲染范围里、卡片却没了，才是在电脑上选掉 / 忽略了
             now_q = {q["qid"]: q for q in snap.get("questions", [])}
+            ents = snap.get("entries") or []
             for qid, q in now_q.items():
-                sig = (q["title"], tuple(q["options"]), q["recommended"], q["answer"])
-                if last_questions.get(qid, (None, None))[1] != sig:
-                    events.append({"type": "question", "id": qid, "name": "" if is_group else title,
-                                   "title": q["title"], "options": q["options"],
-                                   "recommended": q["recommended"], "answer": q["answer"]})
-                last_questions[qid] = (title, sig)
-            for qid, (where, _sig) in list(last_questions.items()):
-                if qid not in now_q and where == title:
-                    events.append({"type": "question_gone", "id": qid})
+                sig = (q["title"], q["detail"], tuple(q["options"]), q["recommended"], q["answer"])
+                old = last_questions.get(qid)
+                ev = {"type": "question", "id": qid, "title": q["title"], "detail": q["detail"],
+                      "name": q["who"] if q["who"] and q["who"] not in humans else ("" if is_group else title),
+                      "chat": "" if is_group else title, "options": q["options"],
+                      "recommended": q["recommended"], "answer": q["answer"]}
+                if old is None or old[1] != sig:
+                    events.append(ev)
+                entry = q["entry"] if q["entry"] is not None else (old[2] if old else None)
+                last_questions[qid] = [title, sig, entry, ev]
+            for qid, lq in list(last_questions.items()):
+                if qid in now_q:
+                    continue
+                where, sig, entry, ev = lq
+                if where == title and (entry is None or (ents and min(ents) <= entry <= max(ents))):
+                    picked = next((o for t in snap.get("done_cards", []) if ev["title"] in t
+                                   for o in ev["options"] if any(o in x for x in t if x != ev["title"])), "")
+                    events.append({"type": "question_gone", "id": qid, "answer": picked})
                     del last_questions[qid]
+                elif sig is None:                         # hub 可能重启过：看不见的卡片也再报一遍
+                    events.append(ev)
+                    lq[1] = (ev["title"], ev["detail"], tuple(ev["options"]), ev["recommended"], ev["answer"])
             # 公告：在等你批准的 bot，把侧边栏里它的预览（"需要批准：…"）报上去
             for n in bots:
                 note = pv.get(n, "") if statuses.get(n) == "waiting" else ""

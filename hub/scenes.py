@@ -797,39 +797,45 @@ class Theme:
                 d.text((W - 4, y), more, font=self.font, fill=(120, 60, 10), anchor="ra")
         return h + 1
 
-    # ---- 提问卡片：点开公告栏上的「待确认」，在屏幕上选一个选项 ----
+    # ---- 提问卡片：有待确认的就自己弹出来一直挂着，在屏幕上选一个选项（点「稍后」先收起一会儿） ----
+    QUESTION_LATER = "稍后"
+
     def question_layout(self, office):
-        """打开着的提问卡片怎么摆：画图和点屏幕判断共用。没打开返回 None。"""
-        q = office.question(office.question_open)
-        if q is None or q.state == "answered":
+        """该摆出来的提问卡片怎么摆：画图和点屏幕判断共用。没有要摆的返回 None。"""
+        q = office.shown_question()
+        if q is None:
             return None
         x0, x1 = 6, W - 6
         lines = self.wrap(q.title, x1 - x0 - 16, max_lines=3)
-        y = 6 + 22 + 15 * len(lines) + 4                     # 标题栏 + 问题
-        opts = []
-        for k, text in enumerate(q.options):                # 选项太长就折成两行
-            indent = 8 + (self.font.getlength("建议") + 7 if k == q.recommended else 0)
-            olines = self.wrap(f"{chr(65 + k)}. {text}", x1 - x0 - 16 - 16, first_indent=indent, max_lines=2)
-            oh = 8 + 14 * len(olines)
-            if y + oh > H - 8:
+        for dlines in (self.wrap(q.detail, x1 - x0 - 16, max_lines=2) if q.detail else [], []):
+            y = 6 + 22 + 15 * len(lines) + 14 * len(dlines) + 4       # 标题栏 + 问题 + 说明（灰字）
+            opts = []
+            for k, text in enumerate(q.options):            # 选项太长就折成两行
+                indent = 8 + (self.font.getlength("建议") + 7 if k == q.recommended else 0)
+                olines = self.wrap(f"{chr(65 + k)}. {text}", x1 - x0 - 16 - 16, first_indent=indent, max_lines=2)
+                oh = 8 + 14 * len(olines)
+                if y + oh > H - 8:
+                    break
+                opts.append(((x0 + 8, y, x1 - 8, y + oh), k, olines))
+                y += oh + 4
+            if len(opts) == len(q.options):                 # 放不下所有选项就不要说明了
                 break
-            opts.append(((x0 + 8, y, x1 - 8, y + oh), k, olines))
-            y += oh + 4
-        return {"q": q, "card": (x0, 6, x1, y + 4), "close": (x1 - 28, 6, x1, 26), "lines": lines, "opts": opts}
+        lw = self.font.getlength(self.QUESTION_LATER) + 10
+        return {"q": q, "card": (x0, 6, x1, y + 4), "close": (x1 - lw - 4, 8, x1 - 4, 24), "lines": lines,
+                "dlines": dlines, "opts": opts}
 
     def question_hit(self, office, x, y):
-        """点屏幕 (x, y)：("option", qid, 下标) | ("close",) | ("open", qid) | None（交给点牛马）。"""
+        """点屏幕 (x, y)：("option", qid, 下标) | ("close",) 稍后再弹 | ("stay",) 不理 | ("open", qid) | None（交给点牛马）。"""
         lay = self.question_layout(office)
         if lay is not None:
             q = lay["q"]
             for (l, t, r, b), k, _ in lay["opts"]:
                 if l <= x <= r and t <= y <= b:
-                    return ("option", q.qid, k) if q.state == "pending" else ("close",)
+                    return ("option", q.qid, k) if q.state == "pending" else ("stay",)
             c = lay["close"]
-            if c[0] <= x <= c[2] and c[1] <= y <= c[3]:
+            if c[0] - 4 <= x <= c[2] + 4 and c[1] - 6 <= y <= c[3] + 4:
                 return ("close",)
-            l, t, r, b = lay["card"]
-            return None if l <= x <= r and t <= y <= b else ("close",)   # 点卡片外面 = 关掉
+            return ("stay",)                                  # 没选之前卡片一直挂着，点别处不关
         for k, it in enumerate(office.board_items(time.time())[:self.BOARD_ROWS]):
             if it["kind"] == "question" and 1 + k * 15 - 2 <= y <= 1 + k * 15 + 16:
                 return ("open", it["qid"])
@@ -849,9 +855,13 @@ class Theme:
         head = "提交中…" if q.state == "sending" else "问你，选一个："
         d.text((x0 + 8, y0 + 10), who + head, font=self.font, fill=INK, anchor="lm")
         cl, ct, cr, cb = lay["close"]
-        d.text(((cl + cr) / 2, (ct + cb) / 2 - 1), "×", font=self.font, fill=INK, anchor="mm")
+        d.rounded_rectangle([cl, ct, cr, cb], 4, fill=(250, 246, 236), outline=INK)
+        d.text(((cl + cr) / 2, (ct + cb) / 2), self.QUESTION_LATER, font=self.font, fill=INK, anchor="mm")
         for k, line in enumerate(lay["lines"]):
             d.text((x0 + 8, y0 + 24 + k * 15), line, font=self.font, fill=INK)
+        dy = y0 + 24 + 15 * len(lay["lines"])
+        for k, line in enumerate(lay["dlines"]):
+            d.text((x0 + 8, dy + k * 14), line, font=self.font, fill=(110, 110, 120))
         sending = q.state == "sending"
         for (l, t, r, b), k, olines in lay["opts"]:
             rec = k == q.recommended

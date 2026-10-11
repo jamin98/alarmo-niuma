@@ -91,6 +91,7 @@ class Handoff:
 
 
 QUESTION_DONE_SHOW = 120.0     # 确认完的问题在公告栏上再挂这么久（绿色「已确认：…」）
+QUESTION_SNOOZE = 60.0         # 待确认的卡片会自己弹出来一直挂着；点「稍后」先收起这么久，到点再弹
 
 
 @dataclass
@@ -105,6 +106,8 @@ class Question:
     answer: str = ""
     t0: float = 0.0
     done_at: float = 0.0
+    detail: str = ""               # 问题下面那行说明
+    chat: str = None               # 卡片在哪个聊天："" = 群聊，否则是单聊名；None = 老桥接没报
 
 
 @dataclass
@@ -139,7 +142,8 @@ class Office:
     auto_short: bool = True
     full2short: dict = field(default_factory=dict)    # 已经见过的 {完整名: 短名}
     questions: list = field(default_factory=list)     # 提问卡片 [Question]，先来的在前
-    question_open: str = ""        # 屏幕上点开了哪张提问卡片（qid），空 = 没开
+    question_open: str = ""        # 屏幕上点开了哪张提问卡片（qid），空 = 没点开（没确认的还是会自己弹出来）
+    question_snooze: dict = field(default_factory=dict)   # 点了「稍后」的卡片 {qid: 到这个时刻再弹}
 
     # ---- 名字映射 ----
     def short(self, name):
@@ -300,20 +304,37 @@ class Office:
     def question(self, qid):
         return next((q for q in self.questions if q.qid == qid), None)
 
-    def set_question(self, qid, bot, title, options, recommended=-1, now=None):
+    def shown_question(self, now=None):
+        """屏幕上该摆出来的提问卡片：点开的那张；没点开就是最早一张还没确认、也没按「稍后」的。没有返回 None。"""
+        now = now or time.time()
+        q = self.question(self.question_open)
+        if q is not None and q.state != "answered":
+            return q
+        return next((q for q in self.questions
+                     if q.state != "answered" and self.question_snooze.get(q.qid, 0) <= now), None)
+
+    def snooze_question(self, qid, now=None):
+        self.question_snooze[qid] = (now or time.time()) + QUESTION_SNOOZE
+        if self.question_open == qid:
+            self.question_open = ""
+
+    def set_question(self, qid, bot, title, options, recommended=-1, now=None, detail="", chat=None):
         """桥接看到一张等你选的提问卡片。同一张（qid 相同）再报一次只更新内容。"""
         now = now or time.time()
         bot = self.short(bot) if bot else ""
         title = " ".join(str(title).split())[:200]
+        detail = " ".join(str(detail).split())[:200]
         options = [" ".join(str(o).split())[:120] for o in options if str(o).strip()][:6]
         q = self.question(qid)
         if q is None:
-            self.questions.append(Question(qid, bot, title, options, recommended, t0=now))
+            self.questions.append(Question(qid, bot, title, options, recommended, t0=now, detail=detail, chat=chat))
             self.questions = self.questions[-12:]
             self.last_activity = now
             self.say("有问题等你确认", "warn", now)
         elif q.state != "answered":
             q.bot, q.title, q.options, q.recommended = bot or q.bot, title, options, recommended
+            q.detail = detail or q.detail
+            q.chat = q.chat if chat is None else chat
             if q.state == "sending" and now - q.done_at > 30:
                 q.state = "pending"                       # 替你点了半天卡片还在：当没点成
         return q
@@ -328,6 +349,7 @@ class Office:
         q.state, q.answer, q.done_at = "answered", " ".join(str(answer).split())[:120] or q.answer or "已处理", now
         if self.question_open == qid:
             self.question_open = ""
+        self.question_snooze.pop(qid, None)
         if first:
             self.say("已确认：" + q.answer, "ok", now)
 
@@ -336,6 +358,7 @@ class Office:
         q = self.question(qid)
         if q is not None and q.state != "answered":
             self.questions.remove(q)
+        self.question_snooze.pop(qid, None)
         if self.question_open == qid:
             self.question_open = ""
 
@@ -515,7 +538,7 @@ class Office:
             "usage": self.usage,
             "remote": {n: st["state"] for n, st in self.remote_state.items()},
             "notices": [{"bot": self.bots[i].name, "text": t} for i, t in self.notices(now)],
-            "questions": [{"id": q.qid, "bot": q.bot, "title": q.title, "options": q.options,
+            "questions": [{"id": q.qid, "bot": q.bot, "title": q.title, "detail": q.detail, "options": q.options,
                            "recommended": q.recommended, "state": q.state, "answer": q.answer}
                           for q in self.questions if q.state != "answered" or now - q.done_at < QUESTION_DONE_SHOW],
             "voice": self.voice,
