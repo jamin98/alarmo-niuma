@@ -31,7 +31,11 @@ voice_device = "CABLE Input"
 # 提问卡片（bot 问你、给几个选项让你选）：挂到屏幕公告栏上，点开在屏幕上选，桥接替你在 Grok Bot 里点。
 # 卡片外层控件的 class 里含下面任意一段就算。认不出来时：卡片显示着跑 python bridge.py --probe，
 # 在 uia_dump.txt 里找包着问题和选项按钮的那一层，把它 class 里的一段填进来；python bridge.py --questions 看认没认出
-question_class = ["question", "ask-user", "askuser", "ask_user"]
+question_class = ["sand-message-card", "question", "ask-user", "askuser", "ask_user"]
+
+# 按住 Core2 左键（发饼）2 秒 = 重启 Grok Bot：杀掉所有 Grok Bot.exe 进程再打开、放到前台。
+# Grok Bot 在跑时自动从它的进程读路径；没在跑时用这里的，不填 = 默认安装位置 %LOCALAPPDATA%\Programs\Grok Bot\Grok Bot.exe
+# grok_exe = 'C:\Users\你\AppData\Local\Programs\Grok Bot\Grok Bot.exe'
 
 # 手动指定某个 bot 的颜色（优先于自动读取），键是群里的完整名字
 # [colors]

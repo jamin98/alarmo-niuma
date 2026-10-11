@@ -806,8 +806,10 @@ class Theme:
         if q is None:
             return None
         x0, x1 = 6, W - 6
-        lines = self.wrap(q.title, x1 - x0 - 16, max_lines=3)
-        for dlines in (self.wrap(q.detail, x1 - x0 - 16, max_lines=2) if q.detail else [], []):
+        tmax = 6 if q.kind == "ask" else 3                  # @你要你回话的整句话显示全一点
+        for tm, with_detail in ((tmax, True), (3, True), (3, False), (2, False)):
+            lines = self.wrap(q.title, x1 - x0 - 16, max_lines=tm)
+            dlines = self.wrap(q.detail, x1 - x0 - 16, max_lines=2) if with_detail and q.detail else []
             y = 6 + 22 + 15 * len(lines) + 14 * len(dlines) + 4       # 标题栏 + 问题 + 说明（灰字）
             opts = []
             for k, text in enumerate(q.options):            # 选项太长就折成两行
@@ -818,7 +820,7 @@ class Theme:
                     break
                 opts.append(((x0 + 8, y, x1 - 8, y + oh), k, olines))
                 y += oh + 4
-            if len(opts) == len(q.options):                 # 放不下所有选项就不要说明了
+            if len(opts) == len(q.options):                 # 放不下所有选项就少显示几行问题 / 不要说明
                 break
         lw = self.font.getlength(self.QUESTION_LATER) + 10
         return {"q": q, "card": (x0, 6, x1, y + 4), "close": (x1 - lw - 4, 8, x1 - 4, 24), "lines": lines,
@@ -852,7 +854,7 @@ class Theme:
         d.rounded_rectangle([x0, y0, x1, y0 + 20], 8, fill=(255, 172, 84))
         d.rectangle([x0, y0 + 12, x1, y0 + 20], (255, 172, 84))
         who = (q.bot + " ") if q.bot else ""
-        head = "提交中…" if q.state == "sending" else "问你，选一个："
+        head = "提交中…" if q.state == "sending" else "@你，要你回：" if q.kind == "ask" else "问你，选一个："
         d.text((x0 + 8, y0 + 10), who + head, font=self.font, fill=INK, anchor="lm")
         cl, ct, cr, cb = lay["close"]
         d.rounded_rectangle([cl, ct, cr, cb], 4, fill=(250, 246, 236), outline=INK)

@@ -73,6 +73,7 @@ class Hub:
         self.clips = {}                    # 等桥接来取的录音 {id: WAV 字节}
         self.https_port = 0
         self.last_send = 0.0
+        self.restart_until = 0.0           # 正在重启 Grok Bot 到这个时刻（防止连按）
         self.frame = None
         self.frame_id = 0
         self._jpg = (None, None, b"")
@@ -146,6 +147,22 @@ class Hub:
             if of.view == "chat":
                 of.view = "office"
             return
+        if button == "restart_grok":        # 按住左键（发饼）2 秒：重启 Grok Bot.exe 并放到前台
+            if now < self.restart_until:
+                of.say("Grok Bot 正在重启", "warn", now)
+            elif self.demo:
+                of.say("重启 Grok Bot（演示）", "ok", now)
+            elif not of.bridge_online(now):
+                of.say("桥接离线，没法重启", "err", now)
+            else:
+                self.restart_until = now + 60
+
+                def done(ok, error):
+                    self.restart_until = 0.0
+                    of.say("Grok Bot 已重启" if ok else "重启失败: " + error[:14], "ok" if ok else "err")
+                self.queue({"type": "restart_grok"}, now, cb=done, extra=45.0)
+                of.say("正在重启 Grok Bot…", "warn", now)
+            return
         if button == "back":                # 左上：一键鼓励 —— 老板挨个走到每个人面前发大饼，同时往群里发一句
             if of.tour_at(now):
                 of.say("老板正在发饼", "warn", now)
@@ -188,6 +205,17 @@ class Hub:
             of.say("桥接离线，没提交", "err", now)
             return {"ok": False, "error": "桥接离线"}
         q.state, q.answer, q.done_at = "sending", q.options[k], now   # done_at 这里先记提交时间，超时用
+        if q.kind == "ask":                                          # @你要你回话：替你回一句
+            full = self.full_name(q.bot)
+            if q.private:
+                cmd = {"type": "send_private", "to": full, "text": q.options[k]}
+            else:
+                cmd = {"type": "send", "text": f"@{full} {q.options[k]}"}
+        else:
+            cmd = {"type": "answer", "qid": q.qid, "bot": self.full_name(q.bot) if q.bot else "",
+                   "title": q.title, "option": q.options[k], "index": k}
+            if q.chat is not None:
+                cmd["chat"] = q.chat                                    # 桥接报来的聊天标题原样带回去
 
         def done(ok, error, qid=q.qid, answer=q.options[k]):
             q2 = of.question(qid)
@@ -197,10 +225,6 @@ class Hub:
                 if q2 is not None and q2.state == "sending":
                     q2.state = "pending"
                 of.say("没提交上: " + error[:14], "err")
-        cmd = {"type": "answer", "qid": q.qid, "bot": self.full_name(q.bot) if q.bot else "",
-               "title": q.title, "option": q.options[k], "index": k}
-        if q.chat is not None:
-            cmd["chat"] = q.chat                                    # 桥接报来的聊天标题原样带回去
         self.queue(cmd, now, cb=done, extra=10.0)
         of.say("提交中…", "warn", now)
         return {"ok": True, "question": "sending"}
@@ -432,6 +456,9 @@ class Hub:
             of.set_remote(str(ev["name"]), str(ev.get("state", "")), now)
         elif t == "note":
             of.set_note(str(ev["name"]), str(ev.get("text", "")))
+        elif t == "backlog":                 # 界面上现在看得到的聊天记录：{"private", "messages": [[发言人, 正文], ...]}
+            of.scan_asks([(str(m[0]), str(m[1])) for m in ev.get("messages", []) if len(m) >= 2],
+                         bool(ev.get("private")), now)
         elif t == "question":                # 提问卡片：{"id", "name", "chat"?, "title", "detail"?, "options": [...], "recommended": 下标, "answer"?}
             qid = str(ev["id"])
             of.set_question(qid, str(ev.get("name", "")), str(ev.get("title", "")),

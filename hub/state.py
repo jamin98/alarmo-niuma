@@ -1,4 +1,6 @@
 """办公室状态：有哪些牛马、各自在干嘛、谁把活交给了谁。"""
+import hashlib
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -91,6 +93,10 @@ class Handoff:
 
 
 QUESTION_DONE_SHOW = 120.0     # 确认完的问题在公告栏上再挂这么久（绿色「已确认：…」）
+# bot 在群里 @你、要你回话拍板（「请你回『同意』」这种）：也当一张卡片挂着，点选项 = 替你 @它回这句
+ASK_WORD_RE = re.compile(r"同意|批准|拍板|放行|授权|点头|回(?:复|个)?\s*[「『“\"]")   # 不含「确认」：bot 常说「确认：…」是报结果
+ASK_STRICT_RE = re.compile(r"同意|批准|拍板|放行|授权|回(?:复|个)?\s*[「『“\"]")   # 私聊里没有 @，要求更明确
+ASK_QUOTE_RE = re.compile(r"回(?:复|个)?\s*[「『“\"]([^」』”\"]{1,12})[」』”\"]")
 QUESTION_SNOOZE = 60.0         # 待确认的卡片会自己弹出来一直挂着；点「稍后」先收起这么久，到点再弹
 
 
@@ -108,6 +114,8 @@ class Question:
     done_at: float = 0.0
     detail: str = ""               # 问题下面那行说明
     chat: str = None               # 卡片在哪个聊天："" = 群聊，否则是单聊名；None = 老桥接没报
+    kind: str = "card"             # card = Grok Bot 里的提问卡片 | ask = bot @你要你回话（选了就替你回一句）
+    private: bool = False          # ask：是私聊里问的（回话也私聊回）
 
 
 @dataclass
@@ -291,7 +299,7 @@ class Office:
         out = []
         for q in self.questions:
             if q.state != "answered":
-                text = ("提交中… " if q.state == "sending" else "待确认：") + q.title
+                text = ("提交中… " if q.state == "sending" else "要你回：" if q.kind == "ask" else "待确认：") + q.title
                 out.append({"kind": "question", "bot": self.index(q.bot), "text": text, "qid": q.qid})
         out += [{"kind": "approval", "bot": i, "text": t, "qid": ""} for i, t in self.notices(now)]
         for q in reversed(self.questions):
@@ -327,7 +335,8 @@ class Office:
         options = [" ".join(str(o).split())[:120] for o in options if str(o).strip()][:6]
         q = self.question(qid)
         if q is None:
-            self.questions.append(Question(qid, bot, title, options, recommended, t0=now, detail=detail, chat=chat))
+            q = Question(qid, bot, title, options, recommended, t0=now, detail=detail, chat=chat)
+            self.questions.append(q)
             self.questions = self.questions[-12:]
             self.last_activity = now
             self.say("有问题等你确认", "warn", now)
@@ -362,6 +371,72 @@ class Office:
         if self.question_open == qid:
             self.question_open = ""
 
+    def ask_options(self, text, private=False):
+        """bot 的这句话是不是 @你、要你回话拍板。是就返回给你选的回话 ["同意", "不同意"]，不是返回 None。"""
+        if private:
+            if not ASK_STRICT_RE.search(text):
+                return None
+        elif not any("@" + h in text for h in self.humans if h) or not ASK_WORD_RE.search(text):
+            return None
+        opts = []
+        for o in ASK_QUOTE_RE.findall(text):
+            o = o.strip()
+            if o and o not in opts:
+                opts.append(o)
+        opts = opts[:4] or ["同意"]
+        if opts == ["同意"]:
+            opts.append("不同意")
+        return opts
+
+    @staticmethod
+    def ask_id(bot, text):
+        return "ask" + hashlib.sha1(f"{bot}\n{text}".encode("utf-8")).hexdigest()[:10]
+
+    def add_ask(self, bot, text, options, private, now):
+        """bot @你要你回话：挂一张 ask 卡片。群里只挂最新的一张（后来的要求把前面没回的顶掉，一般是 PM 汇总过的那句），
+        私聊里每个 bot 一张；这句已经挂过（或回过）就不动。"""
+        qid = self.ask_id(bot, text)
+        if self.question(qid) is not None:
+            return
+        for q in list(self.questions):
+            if q.kind == "ask" and q.private == private and q.state == "pending" and (q.bot == bot or not private):
+                self.drop_question(q.qid)
+        title = text
+        for h in self.humans:                                  # 开头的「@你」不用再显示
+            if h and title.startswith("@" + h):
+                title = title[len(h) + 1:].strip(" ，,:：")
+        q = self.set_question(qid, bot, title, options, -1, now, chat=None)
+        q.kind, q.private = "ask", bool(private)
+        q.title = " ".join(title.split())[:300]
+
+    def scan_asks(self, messages, private=False, now=None):
+        """桥接报来的、界面上现在看得到的一段聊天记录 [(发言人, 正文)]（启动、切聊天、hub 重启时报）：
+        里面 bot @你要你回话、之后你还没回的，补挂成卡片——之前没赶上当新消息报上来的也不漏。"""
+        now = now or time.time()
+        pending, replied = {}, []                          # {bot 短名: (正文, 选项)}，[(卡片 id, 你回的话)]
+        for sender, text in messages:
+            text = self.fix_mentions(" ".join(str(text).split()))
+            if sender in self.humans:                      # 你回过话：同 add_message 的规则收掉
+                named = [b for b in pending if "@" + b in text]
+                for b in named or ([] if "@" in text else list(pending)):
+                    replied.append((self.ask_id(b, pending.pop(b)[0]), text))
+                continue
+            opts = self.ask_options(text, private)
+            if opts:
+                if not private:                            # 群里后来的要求把前面没回的顶掉（同 add_ask）
+                    replied += [(self.ask_id(b, t), None) for b, (t, _o) in pending.items()]
+                    pending.clear()
+                pending[self.short(sender)] = (text, opts)
+        for qid, reply in replied:                         # 已经挂着的卡片、记录里看到你回过了 / 被顶掉了：收起来
+            q = self.question(qid)
+            if q is not None and q.state == "pending":
+                if reply is None:
+                    self.drop_question(qid)
+                else:
+                    self.answer_question(qid, reply[:40], now)
+        for b, (text, opts) in pending.items():
+            self.add_ask(b, text, opts, private, now)
+
     def add_message(self, sender, text, now=None, private=False):
         now = now or time.time()
         is_human = sender in self.humans
@@ -371,6 +446,16 @@ class Office:
         i = -1 if is_human else self.ensure_bot(sender, now)
         self.messages.append(Message(now, sender, text, i >= 0, bool(private)))
         self.chat_scroll = 0
+        if is_human:                       # 你自己回过话了（电脑上打的也算）：同一边（群 / 私聊）等你回的卡片就收起来；
+            asks = [q for q in self.questions          # 话里 @ 了谁就只收那个 bot 的
+                    if q.kind == "ask" and q.state == "pending" and q.private == bool(private)]
+            named = [q for q in asks if q.bot and "@" + q.bot in text]
+            for q in named or ([] if "@" in text else asks):
+                self.answer_question(q.qid, text[:40], now)
+        elif i >= 0:
+            opts = self.ask_options(text, private)
+            if opts:
+                self.add_ask(sender, text, opts, private, now)
         if i < 0:
             return
         self.last_activity = now
@@ -538,7 +623,7 @@ class Office:
             "usage": self.usage,
             "remote": {n: st["state"] for n, st in self.remote_state.items()},
             "notices": [{"bot": self.bots[i].name, "text": t} for i, t in self.notices(now)],
-            "questions": [{"id": q.qid, "bot": q.bot, "title": q.title, "detail": q.detail, "options": q.options,
+            "questions": [{"id": q.qid, "kind": q.kind, "bot": q.bot, "title": q.title, "detail": q.detail, "options": q.options,
                            "recommended": q.recommended, "state": q.state, "answer": q.answer}
                           for q in self.questions if q.state != "answered" or now - q.done_at < QUESTION_DONE_SHOW],
             "voice": self.voice,
