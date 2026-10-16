@@ -17,3 +17,4 @@ firmware/MarkFile
 __pycache__/
 *.pyc
 bridge/uia_dump.txt
+hub/closed_questions.json
