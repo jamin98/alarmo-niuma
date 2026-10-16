@@ -748,7 +748,8 @@ class Theme:
 
     # ---- 公告栏：等你确认 / 批准的事挂在屏幕顶上 ----
     BOARD_ROWS = 2
-    BOARD_BG = {"question": (255, 172, 84), "approval": (255, 226, 110), "confirmed": (160, 228, 170)}
+    BOARD_BG = {"question": (255, 172, 84), "approval": (255, 226, 110), "hint": (214, 226, 240),
+                "confirmed": (160, 228, 170)}
     BOARD_TAP = "点开选"
 
     def notice_board(self, img, d, office, now):
@@ -763,7 +764,7 @@ class Theme:
             y = 1 + k * 15
             bg = self.BOARD_BG[it["kind"]]
             d.rectangle([0, y - 1 if k else 0, W, y + 14], bg)
-            pin = {"question": RED, "approval": RED, "confirmed": (40, 150, 70)}[it["kind"]]
+            pin = {"question": RED, "approval": RED, "hint": (90, 120, 170), "confirmed": (40, 150, 70)}[it["kind"]]
             d.ellipse([4, y + 3, 11, y + 10], pin, outline=INK)                    # 图钉
             d.line([(8, y + 10), (10, y + 13)], INK)
             x0 = 15
@@ -775,7 +776,7 @@ class Theme:
                 x0 += 6 + self.font.getlength(head)
             more = f"+{len(items) - len(rows)}" if k == len(rows) - 1 and len(items) > len(rows) else ""
             x1 = W - 4 - (self.font.getlength(more) + 4 if more else 0)
-            if it["kind"] == "question" and not it["text"].startswith("提交中"):  # 能点：右边标一个「点开选 ▸」
+            if it["kind"] in ("question", "hint") and not it["text"].startswith("提交中"):  # 能点：右边标一个「点开选」
                 tag = self.BOARD_TAP
                 tl = self.font.getlength(tag)
                 d.rounded_rectangle([x1 - tl - 6, y + 1, x1, y + 13], 3, fill=INK)
@@ -799,6 +800,7 @@ class Theme:
 
     # ---- 提问卡片：有待确认的就自己弹出来一直挂着，在屏幕上选一个选项（点「稍后」先收起一会儿） ----
     QUESTION_LATER = "稍后"
+    QUESTION_CLOSE = "关掉"
 
     def question_layout(self, office):
         """该摆出来的提问卡片怎么摆：画图和点屏幕判断共用。没有要摆的返回 None。"""
@@ -823,11 +825,14 @@ class Theme:
             if len(opts) == len(q.options):                 # 放不下所有选项就少显示几行问题 / 不要说明
                 break
         lw = self.font.getlength(self.QUESTION_LATER) + 10
-        return {"q": q, "card": (x0, 6, x1, y + 4), "close": (x1 - lw - 4, 8, x1 - 4, 24), "lines": lines,
-                "dlines": dlines, "opts": opts}
+        cw = self.font.getlength(self.QUESTION_CLOSE) + 10
+        later = (x1 - lw - 4, 8, x1 - 4, 24)
+        return {"q": q, "card": (x0, 6, x1, y + 4), "close": later,
+                "dismiss": (later[0] - cw - 6, 8, later[0] - 6, 24), "lines": lines, "dlines": dlines, "opts": opts}
 
     def question_hit(self, office, x, y):
-        """点屏幕 (x, y)：("option", qid, 下标) | ("close",) 稍后再弹 | ("stay",) 不理 | ("open", qid) | None（交给点牛马）。"""
+        """点屏幕 (x, y)：("option", qid, 下标) | ("close",) 稍后再弹 | ("dismiss", qid) 关掉不再弹 | ("stay",) 不理
+        | ("open", qid) | None（交给点牛马）。"""
         lay = self.question_layout(office)
         if lay is not None:
             q = lay["q"]
@@ -835,11 +840,14 @@ class Theme:
                 if l <= x <= r and t <= y <= b:
                     return ("option", q.qid, k) if q.state == "pending" else ("stay",)
             c = lay["close"]
-            if c[0] - 4 <= x <= c[2] + 4 and c[1] - 6 <= y <= c[3] + 4:
+            if c[0] - 2 <= x <= c[2] + 4 and c[1] - 6 <= y <= c[3] + 4:
                 return ("close",)
+            c = lay["dismiss"]
+            if c[0] - 4 <= x <= c[2] + 2 and c[1] - 6 <= y <= c[3] + 4:
+                return ("dismiss", q.qid)
             return ("stay",)                                  # 没选之前卡片一直挂着，点别处不关
         for k, it in enumerate(office.board_items(time.time())[:self.BOARD_ROWS]):
-            if it["kind"] == "question" and 1 + k * 15 - 2 <= y <= 1 + k * 15 + 16:
+            if it["kind"] in ("question", "hint") and 1 + k * 15 - 2 <= y <= 1 + k * 15 + 16:
                 return ("open", it["qid"])
         return None
 
@@ -859,6 +867,9 @@ class Theme:
         cl, ct, cr, cb = lay["close"]
         d.rounded_rectangle([cl, ct, cr, cb], 4, fill=(250, 246, 236), outline=INK)
         d.text(((cl + cr) / 2, (ct + cb) / 2), self.QUESTION_LATER, font=self.font, fill=INK, anchor="mm")
+        cl, ct, cr, cb = lay["dismiss"]
+        d.rounded_rectangle([cl, ct, cr, cb], 4, fill=(250, 246, 236), outline=INK)
+        d.text(((cl + cr) / 2, (ct + cb) / 2), self.QUESTION_CLOSE, font=self.font, fill=INK, anchor="mm")
         for k, line in enumerate(lay["lines"]):
             d.text((x0 + 8, y0 + 24 + k * 15), line, font=self.font, fill=INK)
         dy = y0 + 24 + 15 * len(lay["lines"])

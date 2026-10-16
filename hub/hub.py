@@ -10,6 +10,7 @@ import asyncio
 import sys
 import io
 import itertools
+import json
 import random
 import socket
 import struct
@@ -52,6 +53,7 @@ class Hub:
             auto_short=bool(o.get("auto_short", True)),
             remote={str(k): str(v) for k, v in cfg.get("remote_bots", {}).items()},
             remote_timeout=float(o.get("remote_timeout", 1800)),
+            ask_mark=str(o.get("ask_mark", "待你拍板")).strip().strip("【】[]"),
         )
         self.font_path = cfg.get("render", {}).get("font") or None
         self.renderer = Renderer(self.font_path)        # 聊天记录页和额度页
@@ -74,6 +76,12 @@ class Hub:
         self.https_port = 0
         self.last_send = 0.0
         self.restart_until = 0.0           # 正在重启 Grok Bot 到这个时刻（防止连按）
+        self.closed_path = HERE / "closed_questions.json"   # 关掉过的卡片记在这里，hub 重启后桥接再报也不重挂
+        try:
+            self.office.question_closed |= set(json.loads(self.closed_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+        self.closed_saved = len(self.office.question_closed)
         self.frame = None
         self.frame_id = 0
         self._jpg = (None, None, b"")
@@ -178,6 +186,16 @@ class Hub:
         of.whip(now)
         self.send_text(self.buttons.get("dial_text", ""), now)
 
+    def save_closed(self):
+        of = self.office
+        if len(of.question_closed) > 400:             # 只留最近的一批（集合没顺序，多了就整个清一半也无妨）
+            of.question_closed = set(list(of.question_closed)[-200:])
+        self.closed_saved = len(of.question_closed)
+        try:
+            self.closed_path.write_text(json.dumps(sorted(of.question_closed)), encoding="utf-8")
+        except OSError as e:
+            print("记不下关掉的卡片:", e)
+
     def question_tap(self, hit, now=None):
         """点了提问卡片或公告栏上的「待确认」：打开卡片 / 稍后再弹 / 选一个选项（让桥接在 Grok Bot 里替你点）。
         卡片没确认前一直挂在屏幕上，点卡片外面不关（stay）。"""
@@ -189,6 +207,10 @@ class Hub:
             return {"ok": True, "question": "open"}
         if hit[0] == "stay":
             return {"ok": True, "question": "stay"}
+        if hit[0] == "dismiss":                       # 「关掉」：屏幕上不再挂（Grok Bot 里不动）
+            of.close_question(hit[1])
+            of.say("已关掉（Grok 里没动）", "ok", now)
+            return {"ok": True, "question": "dismissed"}
         if hit[0] == "close":
             q = of.shown_question(now)
             if q is not None:
@@ -368,6 +390,8 @@ class Hub:
         while True:
             t = time.time()
             self.office.tick(t)
+            if len(self.office.question_closed) != self.closed_saved:
+                self.save_closed()
             for cid, t0 in list(self.pending.items()):
                 if t - t0 > 30:
                     del self.pending[cid]
@@ -461,6 +485,9 @@ class Hub:
                          bool(ev.get("private")), now)
         elif t == "question":                # 提问卡片：{"id", "name", "chat"?, "title", "detail"?, "options": [...], "recommended": 下标, "answer"?}
             qid = str(ev["id"])
+            if ev.get("name") and not of.is_worker(str(ev["name"])):   # 不是工位上的 bot 问的（Grok Bot 自带的助手）：不挂
+                of.drop_question(qid)
+                return
             of.set_question(qid, str(ev.get("name", "")), str(ev.get("title", "")),
                             list(ev.get("options", [])), int(ev.get("recommended", -1)), now,
                             detail=str(ev.get("detail", "")), chat=None if ev.get("chat") is None else str(ev["chat"]))

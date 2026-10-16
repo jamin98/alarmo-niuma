@@ -93,10 +93,20 @@ class Handoff:
 
 
 QUESTION_DONE_SHOW = 120.0     # 确认完的问题在公告栏上再挂这么久（绿色「已确认：…」）
-# bot 在群里 @你、要你回话拍板（「请你回『同意』」这种）：也当一张卡片挂着，点选项 = 替你 @它回这句
+# bot 要你回话拍板，分两档：
+#   确定：话里带约定的标记（默认「【待你拍板】」，config 里 [office] ask_mark 可改）-> 卡片自己弹出来一直挂着，点选项 = 替你 @它回这句
+#   猜的：群里 @你（私聊不用）+ 关键词 + 请求语气，而且关键词前面没有「不再 / 已经…」-> 只在公告栏挂一条提醒，点一下才打开卡片
+# （Grok Bot 自己的提问卡片走桥接的 question 事件，本来就是确定的。）
 ASK_WORD_RE = re.compile(r"同意|批准|拍板|放行|授权|点头|回(?:复|个)?\s*[「『“\"]")   # 不含「确认」：bot 常说「确认：…」是报结果
 ASK_STRICT_RE = re.compile(r"同意|批准|拍板|放行|授权|回(?:复|个)?\s*[「『“\"]")   # 私聊里没有 @，要求更明确
+ASK_NEG_RE = re.compile(r"不|没|别|无需|无须|免|已|按你|照你|你之前|你刚")   # 同一小句里关键词前面有这些：是在说「不用等你同意 / 已经批了」
+ASK_CLAUSE_RE = re.compile(r"[，。；！？,.;!?\s]+")
+ASK_AXA_RE = re.compile(r"(.)不\1")   # 「要不要 / 同不同意 / 行不行」是在问你，里面的「不」不算否定
+ASK_REQ_RE = re.compile(r"请你|麻烦你|需要你|要你|等你|你看|是否|可否|能否|行不行|可不可以|[吗么][？?]?|[？?]|回(?:复|个)?\s*[「『“\"]")
+ASK_HINT_SHOW = 600.0          # 猜的提醒在公告栏上挂这么久没人理就收掉
 ASK_QUOTE_RE = re.compile(r"回(?:复|个)?\s*[「『“\"]([^」』”\"]{1,12})[」』”\"]")
+ASK_ALT_RE = re.compile(r"\s*(?:或者?|还是|、|/|／)\s*[「『“\"]([^」』”\"]{1,12})[」』”\"]")   # 回「换」或「不换」：后面的也是选项
+CARD_MOVED_ON = 30.0           # Grok 提问卡片挂出来这么久以后，问的那个 bot 又说话了 = 已经有人选过 / 它不等了，卡片自己收掉
 QUESTION_SNOOZE = 60.0         # 待确认的卡片会自己弹出来一直挂着；点「稍后」先收起这么久，到点再弹
 
 
@@ -116,6 +126,7 @@ class Question:
     chat: str = None               # 卡片在哪个聊天："" = 群聊，否则是单聊名；None = 老桥接没报
     kind: str = "card"             # card = Grok Bot 里的提问卡片 | ask = bot @你要你回话（选了就替你回一句）
     private: bool = False          # ask：是私聊里问的（回话也私聊回）
+    sure: bool = True              # ask：False = 只是猜它要你回（没带标记），公告栏提醒一下，不自己弹出来
 
 
 @dataclass
@@ -152,6 +163,9 @@ class Office:
     questions: list = field(default_factory=list)     # 提问卡片 [Question]，先来的在前
     question_open: str = ""        # 屏幕上点开了哪张提问卡片（qid），空 = 没点开（没确认的还是会自己弹出来）
     question_snooze: dict = field(default_factory=dict)   # 点了「稍后」的卡片 {qid: 到这个时刻再弹}
+    ask_mark: str = "待你拍板"     # bot 话里带「【待你拍板】」= 确定要你回话；空 = 不认标记
+    ask_expired: set = field(default_factory=set)         # 挂满 ASK_HINT_SHOW 自己收掉的提醒，记录里再看到也不重挂
+    question_closed: set = field(default_factory=set)     # 你点了「关掉」/ 自己收掉的卡片：桥接再报也不重挂
 
     # ---- 名字映射 ----
     def short(self, name):
@@ -178,6 +192,11 @@ class Office:
             if b.name == name:
                 return i
         return -1
+
+    def is_worker(self, name):
+        """name（完整名或短名）是不是工位上的 bot。工位还没报上来时都算，免得 hub 刚启动漏掉。"""
+        s = self.full2short.get(name) or self.aliases.get(name) or (auto_short(name) if self.auto_short else name)
+        return not self.bots or self.index(s) >= 0 or self.index(name) >= 0
 
     def bridge_online(self, now):
         return now - self.bridge_seen < 45
@@ -294,14 +313,19 @@ class Office:
         return out
 
     def board_items(self, now):
-        """公告栏上的每一行，要紧的在前：[{"kind": question|approval|confirmed, "bot": 下标或 -1, "text", "qid"}]。
-        question = 等你选的提问卡片（点一下打开选项）；confirmed = 刚确认完的，挂一会儿。"""
-        out = []
+        """公告栏上的每一行，要紧的在前：[{"kind": question|approval|hint|confirmed, "bot": 下标或 -1, "text", "qid"}]。
+        question = 等你选的提问卡片（点一下打开选项）；hint = 猜它要你回话（点一下打开）；confirmed = 刚确认完的，挂一会儿。"""
+        out, hints = [], []
         for q in self.questions:
-            if q.state != "answered":
+            if q.state == "answered":
+                continue
+            if q.sure or q.state == "sending":
                 text = ("提交中… " if q.state == "sending" else "要你回：" if q.kind == "ask" else "待确认：") + q.title
                 out.append({"kind": "question", "bot": self.index(q.bot), "text": text, "qid": q.qid})
+            else:
+                hints.append({"kind": "hint", "bot": self.index(q.bot), "text": "可能要你回：" + q.title, "qid": q.qid})
         out += [{"kind": "approval", "bot": i, "text": t, "qid": ""} for i, t in self.notices(now)]
+        out += hints
         for q in reversed(self.questions):
             if q.state == "answered" and now - q.done_at < QUESTION_DONE_SHOW:
                 out.append({"kind": "confirmed", "bot": self.index(q.bot), "text": f"已确认：{q.answer}（{q.title}）",
@@ -318,8 +342,8 @@ class Office:
         q = self.question(self.question_open)
         if q is not None and q.state != "answered":
             return q
-        return next((q for q in self.questions
-                     if q.state != "answered" and self.question_snooze.get(q.qid, 0) <= now), None)
+        return next((q for q in self.questions                 # 猜的（sure=False）不自己弹，点公告栏才打开
+                     if q.state != "answered" and q.sure and self.question_snooze.get(q.qid, 0) <= now), None)
 
     def snooze_question(self, qid, now=None):
         self.question_snooze[qid] = (now or time.time()) + QUESTION_SNOOZE
@@ -327,8 +351,10 @@ class Office:
             self.question_open = ""
 
     def set_question(self, qid, bot, title, options, recommended=-1, now=None, detail="", chat=None):
-        """桥接看到一张等你选的提问卡片。同一张（qid 相同）再报一次只更新内容。"""
+        """桥接看到一张等你选的提问卡片。同一张（qid 相同）再报一次只更新内容。关掉过的不再挂，返回 None。"""
         now = now or time.time()
+        if qid in self.question_closed:
+            return None
         bot = self.short(bot) if bot else ""
         title = " ".join(str(title).split())[:200]
         detail = " ".join(str(detail).split())[:200]
@@ -371,49 +397,81 @@ class Office:
         if self.question_open == qid:
             self.question_open = ""
 
+    def close_question(self, qid, answer=None, now=None):
+        """收掉一张卡片，以后桥接再报也不挂：answer=None 是你点了「关掉」（直接拿掉），否则记成已处理。"""
+        self.question_closed.add(qid)
+        if answer is None:
+            self.drop_question(qid)
+        else:
+            self.answer_question(qid, answer, now)
+
     def ask_options(self, text, private=False):
-        """bot 的这句话是不是 @你、要你回话拍板。是就返回给你选的回话 ["同意", "不同意"]，不是返回 None。"""
-        if private:
-            if not ASK_STRICT_RE.search(text):
+        """bot 的这句话是不是要你回话拍板。是就返回 (给你选的回话 ["同意", "不同意"], 确定吗)，不是返回 None。
+        确定 = 带了约定的标记；不确定 = 群里 @你（私聊不用）+ 关键词 + 请求语气，而且关键词不是「不再等你授权」这种说法。"""
+        sure = bool(self.ask_mark_re().search(text))
+        if not sure:
+            if not private and not any("@" + h in text for h in self.humans if h):
                 return None
-        elif not any("@" + h in text for h in self.humans if h) or not ASK_WORD_RE.search(text):
-            return None
+            words = ASK_STRICT_RE if private else ASK_WORD_RE
+            clauses = [ASK_AXA_RE.sub(r"\1", c) for c in ASK_CLAUSE_RE.split(text)]
+            if not any(not ASK_NEG_RE.search(c[:m.start()])
+                       for c in clauses for m in words.finditer(c)) or not ASK_REQ_RE.search(text):
+                return None
         opts = []
-        for o in ASK_QUOTE_RE.findall(text):
-            o = o.strip()
-            if o and o not in opts:
-                opts.append(o)
+        for m in ASK_QUOTE_RE.finditer(text):
+            found, end = [m.group(1)], m.end()
+            while (alt := ASK_ALT_RE.match(text, end)) is not None:
+                found.append(alt.group(1))
+                end = alt.end()
+            for o in found:
+                o = o.strip()
+                if o and o not in opts:
+                    opts.append(o)
         opts = opts[:4] or ["同意"]
         if opts == ["同意"]:
             opts.append("不同意")
-        return opts
+        return opts, sure
+
+    def ask_mark_re(self):
+        """「【待你拍板】」：括号是全角、半角、方括号都认。"""
+        if not self.ask_mark:
+            return re.compile(r"(?!)")
+        return re.compile(r"[【\[〔(（]\s*" + re.escape(self.ask_mark) + r"\s*[】\]〕)）]")
 
     @staticmethod
     def ask_id(bot, text):
         return "ask" + hashlib.sha1(f"{bot}\n{text}".encode("utf-8")).hexdigest()[:10]
 
-    def add_ask(self, bot, text, options, private, now):
-        """bot @你要你回话：挂一张 ask 卡片。群里只挂最新的一张（后来的要求把前面没回的顶掉，一般是 PM 汇总过的那句），
-        私聊里每个 bot 一张；这句已经挂过（或回过）就不动。"""
+    @staticmethod
+    def ask_bumps(old_sure, new_sure, private, same_bot):
+        """新来一句要你回的，前面没回的那张要不要顶掉：群里后来的顶掉前面的（一般是 PM 汇总过的那句），
+        私聊里每个 bot 一张；猜的不顶掉确定的。"""
+        return (same_bot or not private) and (new_sure or not old_sure)
+
+    def add_ask(self, bot, text, options, private, now, sure=True):
+        """bot 要你回话：挂一张 ask 卡片（sure=False 只在公告栏提醒）。这句已经挂过（或回过、提醒过期了）就不动。"""
         qid = self.ask_id(bot, text)
-        if self.question(qid) is not None:
+        if self.question(qid) is not None or qid in self.ask_expired or qid in self.question_closed:
             return
         for q in list(self.questions):
-            if q.kind == "ask" and q.private == private and q.state == "pending" and (q.bot == bot or not private):
+            if (q.kind == "ask" and q.private == private and q.state == "pending"
+                    and self.ask_bumps(q.sure, sure, private, q.bot == bot)):
                 self.drop_question(q.qid)
-        title = text
+        title = self.ask_mark_re().sub(" ", text).strip(" ，,:：")
         for h in self.humans:                                  # 开头的「@你」不用再显示
             if h and title.startswith("@" + h):
                 title = title[len(h) + 1:].strip(" ，,:：")
         q = self.set_question(qid, bot, title, options, -1, now, chat=None)
-        q.kind, q.private = "ask", bool(private)
+        q.kind, q.private, q.sure = "ask", bool(private), bool(sure)
         q.title = " ".join(title.split())[:300]
+        if not sure:
+            self.say(f"{bot}可能要你回话", "ok", now)
 
     def scan_asks(self, messages, private=False, now=None):
         """桥接报来的、界面上现在看得到的一段聊天记录 [(发言人, 正文)]（启动、切聊天、hub 重启时报）：
-        里面 bot @你要你回话、之后你还没回的，补挂成卡片——之前没赶上当新消息报上来的也不漏。"""
+        里面 bot 要你回话、之后你还没回的，补挂上——之前没赶上当新消息报上来的也不漏。"""
         now = now or time.time()
-        pending, replied = {}, []                          # {bot 短名: (正文, 选项)}，[(卡片 id, 你回的话)]
+        pending, replied = {}, []                          # {bot 短名: (正文, 选项, 确定吗)}，[(卡片 id, 你回的话)]
         for sender, text in messages:
             text = self.fix_mentions(" ".join(str(text).split()))
             if sender in self.humans:                      # 你回过话：同 add_message 的规则收掉
@@ -421,12 +479,19 @@ class Office:
                 for b in named or ([] if "@" in text else list(pending)):
                     replied.append((self.ask_id(b, pending.pop(b)[0]), text))
                 continue
-            opts = self.ask_options(text, private)
-            if opts:
-                if not private:                            # 群里后来的要求把前面没回的顶掉（同 add_ask）
-                    replied += [(self.ask_id(b, t), None) for b, (t, _o) in pending.items()]
-                    pending.clear()
-                pending[self.short(sender)] = (text, opts)
+            if not self.is_worker(sender):                 # 不是工位上的 bot（比如 Grok Bot 自带的助手）：不算
+                continue
+            got = self.ask_options(text, private)
+            if not got:
+                continue
+            opts, sure = got
+            bot = self.short(sender)
+            for b, (t, _o, s) in list(pending.items()):    # 同 add_ask 的顶掉规则
+                if self.ask_bumps(s, sure, private, b == bot):
+                    replied.append((self.ask_id(b, t), None))
+                    del pending[b]
+            if bot not in pending:                         # 它前面那句确定的没被这句猜的顶掉：留着前面那句
+                pending[bot] = (text, opts, sure)
         for qid, reply in replied:                         # 已经挂着的卡片、记录里看到你回过了 / 被顶掉了：收起来
             q = self.question(qid)
             if q is not None and q.state == "pending":
@@ -434,8 +499,8 @@ class Office:
                     self.drop_question(qid)
                 else:
                     self.answer_question(qid, reply[:40], now)
-        for b, (text, opts) in pending.items():
-            self.add_ask(b, text, opts, private, now)
+        for b, (text, opts, sure) in sorted(pending.items(), key=lambda kv: not kv[1][2]):   # 确定的先挂，猜的顶不掉它
+            self.add_ask(b, text, opts, private, now, sure)
 
     def add_message(self, sender, text, now=None, private=False):
         now = now or time.time()
@@ -453,9 +518,12 @@ class Office:
             for q in named or ([] if "@" in text else asks):
                 self.answer_question(q.qid, text[:40], now)
         elif i >= 0:
-            opts = self.ask_options(text, private)
-            if opts:
-                self.add_ask(sender, text, opts, private, now)
+            for q in list(self.questions):         # 问你的 bot 接着说话了：Grok 提问卡片会让它停下来等，说明已经选过 / 不等了
+                if q.kind == "card" and q.state == "pending" and q.bot == sender and now - q.t0 > CARD_MOVED_ON:
+                    self.close_question(q.qid, "已处理（它接着干了）", now)
+            got = self.ask_options(text, private)
+            if got:
+                self.add_ask(sender, text, got[0], private, now, got[1])
         if i < 0:
             return
         self.last_activity = now
@@ -604,6 +672,11 @@ class Office:
 
     def tick(self, now):
         self.handoffs = [h for h in self.handoffs if now - h.t0 < T_HANDOFF]
+        for q in list(self.questions):     # 猜它要你回的提醒，挂久了没人理（也没点开）就收掉
+            if (q.kind == "ask" and not q.sure and q.state == "pending" and now - q.t0 > ASK_HINT_SHOW
+                    and self.question_open != q.qid):
+                self.drop_question(q.qid)
+                self.ask_expired.add(q.qid)
         # 桥接掉线后，它之前报的状态不可信了
         if self.bridge_seen and not self.bridge_online(now):
             for b in self.bots:
@@ -623,7 +696,7 @@ class Office:
             "usage": self.usage,
             "remote": {n: st["state"] for n, st in self.remote_state.items()},
             "notices": [{"bot": self.bots[i].name, "text": t} for i, t in self.notices(now)],
-            "questions": [{"id": q.qid, "kind": q.kind, "bot": q.bot, "title": q.title, "detail": q.detail, "options": q.options,
+            "questions": [{"id": q.qid, "kind": q.kind, "sure": q.sure, "bot": q.bot, "title": q.title, "detail": q.detail, "options": q.options,
                            "recommended": q.recommended, "state": q.state, "answer": q.answer}
                           for q in self.questions if q.state != "answered" or now - q.done_at < QUESTION_DONE_SHOW],
             "voice": self.voice,
